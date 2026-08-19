@@ -22,7 +22,7 @@ use gpui_component::{
     select::{Select, SelectItem, SelectState},
     switch::Switch,
     tab::{Tab, TabBar},
-    table::{Column, Table, TableDelegate, TableEvent, TableState},
+    table::{Column, ColumnSort, Table, TableDelegate, TableEvent, TableState},
     v_flex, ActiveTheme as _, Disableable, Icon, IconName, IndexPath, Root, Sizable as _, Theme,
     ThemeMode, WindowExt as _,
 };
@@ -33,8 +33,8 @@ use iot_mock::model::{
 };
 use iot_mock::protocol::{
     modbus::{parse_modbus_hex, ModbusFrameParse, ModbusTcpServer, DEFAULT_PORT},
-    shared_message_log, MessageLogEntry, MsgDirection, ProtocolCard, ProtocolContext,
-    ServerState, ServerStats, SharedMessageLog,
+    shared_message_log, MessageLogEntry, MsgDirection, ProtocolCard, ProtocolContext, ServerState,
+    ServerStats, SharedMessageLog,
 };
 
 /// UI refresh interval (milliseconds).
@@ -307,7 +307,13 @@ fn build_modbus_frames(
 ) -> Result<(Vec<u8>, Vec<u8>), String> {
     let pdu = match fc {
         0x01 | 0x02 | 0x03 | 0x04 => {
-            vec![fc, (addr >> 8) as u8, addr as u8, (qty >> 8) as u8, qty as u8]
+            vec![
+                fc,
+                (addr >> 8) as u8,
+                addr as u8,
+                (qty >> 8) as u8,
+                qty as u8,
+            ]
         }
         0x05 => {
             let s = value_text.trim();
@@ -332,8 +338,14 @@ fn build_modbus_frames(
         0x0F => {
             let bits = parse_bit_string(value_text, qty)?;
             let data = pack_bits(&bits);
-            let mut p =
-                vec![fc, (addr >> 8) as u8, addr as u8, (qty >> 8) as u8, qty as u8, data.len() as u8];
+            let mut p = vec![
+                fc,
+                (addr >> 8) as u8,
+                addr as u8,
+                (qty >> 8) as u8,
+                qty as u8,
+                data.len() as u8,
+            ];
             p.extend_from_slice(&data);
             p
         }
@@ -371,7 +383,11 @@ fn build_modbus_frames(
 
 /// Render bytes as big-endian hex (space separated).
 fn hex_bytes(bytes: &[u8]) -> String {
-    bytes.iter().map(|b| format!("{b:02X}")).collect::<Vec<_>>().join(" ")
+    bytes
+        .iter()
+        .map(|b| format!("{b:02X}"))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// The register table delegate: columns + per-area row rendering.
@@ -571,6 +587,205 @@ impl TableDelegate for RegTableDelegate {
         // Tint the whole cell when the value just changed.
         el.when(changed, |this| this.bg(theme.primary.opacity(0.06)))
             .into_any_element()
+    }
+}
+
+/// Column index of the message-log table's receive-time column.
+const LOG_TIME_COL: usize = 0;
+
+/// The message-log table delegate: a read-only, virtualized table of protocol
+/// frames built from the same [`Table`] component family as the register table.
+///
+/// The receive-time column is sortable; the default view is newest-first
+/// (descending time) so the most recently received data is shown on top and
+/// easy to spot. The table is fed from the shared ring buffer every refresh
+/// tick, so it updates automatically as frames arrive.
+pub struct LogTableDelegate {
+    /// Canonical entries in arrival order (oldest first), untouched by sorting.
+    entries: Vec<MessageLogEntry>,
+    /// Displayed row order after applying the active sort.
+    rows: Vec<MessageLogEntry>,
+    columns: Vec<Column>,
+    /// Active sort state: `(column index, direction)`.
+    sort: (usize, ColumnSort),
+}
+
+impl LogTableDelegate {
+    fn new() -> Self {
+        Self {
+            entries: Vec::new(),
+            rows: Vec::new(),
+            columns: vec![
+                // `.descending()` marks the time column as sortable and shows
+                // the "sort descending" affordance on load (newest first).
+                Column::new("time", "接收时间")
+                    .width(90.)
+                    .resizable(false)
+                    .descending(),
+                Column::new("dir", "方向").width(70.).resizable(false),
+                Column::new("fc", "功能码").width(90.).resizable(false),
+                Column::new("len", "大小").width(110.).resizable(false),
+                Column::new("hex", "消息").width(400.).resizable(true),
+                Column::new("op", "操作").width(90.).resizable(false),
+            ],
+            sort: (LOG_TIME_COL, ColumnSort::Descending),
+        }
+    }
+
+    /// Replace the displayed entries with a fresh snapshot, preserving the
+    /// active sort so the current column order is kept across updates.
+    fn apply_entries(&mut self, entries: Vec<MessageLogEntry>) {
+        self.entries = entries;
+        self.reapply_sort();
+    }
+
+    /// Recompute `rows` (display order) to `entries` under the active sort.
+    /// The canonical `entries` vector is left untouched so toggling back to the
+    /// default state always restores arrival (oldest-first) order.
+    fn reapply_sort(&mut self) {
+        let (col_ix, dir) = self.sort;
+        let mut rows = self.entries.clone();
+        if col_ix == LOG_TIME_COL {
+            rows.sort_by_key(|e| e.ts_ms);
+            if dir == ColumnSort::Descending {
+                rows.reverse();
+            }
+        }
+        self.rows = rows;
+    }
+
+    /// The entry displayed at `row_ix`, if any.
+    fn entry(&self, row_ix: usize) -> Option<&MessageLogEntry> {
+        self.rows.get(row_ix)
+    }
+}
+
+impl TableDelegate for LogTableDelegate {
+    fn columns_count(&self, _: &App) -> usize {
+        self.columns.len()
+    }
+
+    fn rows_count(&self, _: &App) -> usize {
+        self.rows.len()
+    }
+
+    fn column(&self, col_ix: usize, _: &App) -> &Column {
+        &self.columns[col_ix]
+    }
+
+    fn perform_sort(
+        &mut self,
+        col_ix: usize,
+        sort: ColumnSort,
+        _: &mut Window,
+        cx: &mut Context<TableState<Self>>,
+    ) {
+        self.sort = (col_ix, sort);
+        self.reapply_sort();
+        cx.notify();
+    }
+
+    fn render_empty(
+        &mut self,
+        _: &mut Window,
+        cx: &mut Context<TableState<Self>>,
+    ) -> impl IntoElement {
+        h_flex()
+            .size_full()
+            .justify_center()
+            .items_center()
+            .text_size(px(12.))
+            .text_color(cx.theme().muted_foreground)
+            .child("暂无消息日志 · 启动协议并接收/发送请求后自动记录")
+    }
+
+    fn render_td(
+        &mut self,
+        row_ix: usize,
+        col_ix: usize,
+        _: &mut Window,
+        cx: &mut Context<TableState<Self>>,
+    ) -> impl IntoElement {
+        let theme = cx.theme();
+        let Some(e) = self.entry(row_ix) else {
+            return div().into_any_element();
+        };
+        match self.columns[col_ix].key.as_ref() {
+            "time" => div()
+                .px_2()
+                .text_size(px(11.))
+                .text_color(theme.muted_foreground)
+                .child(e.time.clone())
+                .into_any_element(),
+            "dir" => {
+                let (dir_color, dir_icon) = match e.direction {
+                    MsgDirection::Received => (theme.blue, IconName::ArrowDown),
+                    MsgDirection::Sent => (theme.green, IconName::ArrowUp),
+                };
+                h_flex()
+                    .px_2()
+                    .gap_1()
+                    .items_center()
+                    .child(Icon::new(dir_icon).small().text_color(dir_color))
+                    .child(
+                        div()
+                            .text_size(px(12.))
+                            .text_color(dir_color)
+                            .child(e.direction.label()),
+                    )
+                    .into_any_element()
+            }
+            "fc" => div()
+                .px_2()
+                .text_size(px(12.))
+                .text_color(theme.foreground)
+                .child(format!("FC {:#04X}", e.function_code))
+                .into_any_element(),
+            "len" => div()
+                .px_2()
+                .text_size(px(12.))
+                .text_color(theme.muted_foreground)
+                .child(format!("{} B · {} 寄存器", e.bytes, e.registers))
+                .into_any_element(),
+            "hex" => {
+                let hex = e.hex.clone();
+                h_flex()
+                    .px_2()
+                    .gap_2()
+                    .items_center()
+                    .child(
+                        div()
+                            .flex_1()
+                            .text_size(px(11.))
+                            .text_color(theme.foreground)
+                            .child(truncate_hex(&hex, 80)),
+                    )
+                    .into_any_element()
+            }
+            "op" => {
+                let hex = e.hex.clone();
+                h_flex()
+                    .px_2()
+                    .gap_2()
+                    .items_center()
+                    .child(
+                        Button::new(("copy-log", row_ix))
+                            .ghost()
+                            .xsmall()
+                            .icon(IconName::Copy)
+                            .tooltip("复制完整消息")
+                            .on_click(move |_, window, cx| {
+                                cx.write_to_clipboard(gpui::ClipboardItem::new_string(hex.clone()));
+                                window.push_notification(
+                                    Notification::info("已复制完整消息到剪贴板"),
+                                    cx,
+                                );
+                            }),
+                    )
+                    .into_any_element()
+            }
+            _ => div().into_any_element(),
+        }
     }
 }
 
@@ -916,6 +1131,8 @@ pub struct AppView {
     gen_value_input: Entity<InputState>,
     gen_str_len_input: Entity<InputState>,
     table: Entity<TableState<RegTableDelegate>>,
+    /// Virtualized message-log table (same component as the register table).
+    log_table: Entity<TableState<LogTableDelegate>>,
     active_area: Area,
     selected_row: Option<usize>,
     auto_sim: Arc<AtomicBool>,
@@ -963,6 +1180,18 @@ impl AppView {
                 .col_movable(false)
                 .col_resizable(true)
                 .row_selectable(true)
+                .col_selectable(false)
+        });
+
+        // -- message-log table -------------------------------------------------
+        // Read-only, virtualized; the receive-time column is sortable and the
+        // default view is newest-first so the latest received data sits on top.
+        let log_table = cx.new(|cx| {
+            TableState::new(LogTableDelegate::new(), window, cx)
+                .sortable(true)
+                .col_movable(false)
+                .col_resizable(true)
+                .row_selectable(false)
                 .col_selectable(false)
         });
 
@@ -1048,7 +1277,12 @@ impl AppView {
             .map(|&b| ByteOrderItem(b))
             .collect::<Vec<_>>();
         let gen_order_select = cx.new(|cx| {
-            SelectState::new(gen_order_items, Some(IndexPath::default().row(0)), window, cx)
+            SelectState::new(
+                gen_order_items,
+                Some(IndexPath::default().row(0)),
+                window,
+                cx,
+            )
         });
         let gen_tx_input = cx.new(|cx| InputState::new(window, cx).default_value("1"));
         let gen_unit_input = cx.new(|cx| InputState::new(window, cx).default_value("1"));
@@ -1198,6 +1432,7 @@ impl AppView {
                             store_loop.write().unwrap().simulate_tick(tick);
                         }
                         app.tick_ui(cx);
+                        app.push_log_snapshot(cx);
                     })
                     .is_err();
                 if done {
@@ -1238,6 +1473,7 @@ impl AppView {
             gen_value_input,
             gen_str_len_input,
             table,
+            log_table,
             active_area: Area::HoldingRegisters,
             selected_row: None,
             auto_sim,
@@ -1265,6 +1501,20 @@ impl AppView {
     /// and update the cached revision.
     fn tick_ui(&mut self, cx: &mut Context<Self>) {
         self.push_snapshot(cx);
+    }
+
+    /// Push a fresh snapshot of the shared message ring buffer into the log
+    /// table, so it reacts to received/sent frames automatically every tick.
+    fn push_log_snapshot(&mut self, cx: &mut Context<Self>) {
+        let entries: Vec<MessageLogEntry> = {
+            let guard = self.logs.read().unwrap();
+            guard.iter().cloned().collect()
+        };
+        self.log_table.update(cx, |t, cx| {
+            t.delegate_mut().apply_entries(entries);
+            cx.notify();
+        });
+        cx.notify();
     }
 
     fn push_snapshot(&mut self, cx: &mut Context<Self>) {
@@ -2478,18 +2728,55 @@ impl AppView {
             let select_row = h_flex()
                 .gap_3()
                 .items_end()
-                .child(field("功能码", Select::new(&gen_fc_select).small().menu_width(gpui::rems(24.)).into_any_element(), 260.0))
-                .child(field("数据类型", Select::new(&gen_type_select).small().menu_width(gpui::rems(12.)).into_any_element(), 150.0))
-                .child(field("字节序", Select::new(&gen_order_select).small().menu_width(gpui::rems(18.)).into_any_element(), 190.0));
+                .child(field(
+                    "功能码",
+                    Select::new(&gen_fc_select)
+                        .small()
+                        .menu_width(gpui::rems(24.))
+                        .into_any_element(),
+                    260.0,
+                ))
+                .child(field(
+                    "数据类型",
+                    Select::new(&gen_type_select)
+                        .small()
+                        .menu_width(gpui::rems(12.))
+                        .into_any_element(),
+                    150.0,
+                ))
+                .child(field(
+                    "字节序",
+                    Select::new(&gen_order_select)
+                        .small()
+                        .menu_width(gpui::rems(18.))
+                        .into_any_element(),
+                    190.0,
+                ));
 
             // Header fields.
             let header_row = h_flex()
                 .gap_3()
                 .items_end()
-                .child(field("事务ID", Input::new(&gen_tx_input).small().into_any_element(), 70.0))
-                .child(field("单元ID", Input::new(&gen_unit_input).small().into_any_element(), 70.0))
-                .child(field("起始地址", Input::new(&gen_addr_input).small().into_any_element(), 90.0))
-                .child(field("数量/长度", Input::new(&gen_qty_input).small().into_any_element(), 90.0));
+                .child(field(
+                    "事务ID",
+                    Input::new(&gen_tx_input).small().into_any_element(),
+                    70.0,
+                ))
+                .child(field(
+                    "单元ID",
+                    Input::new(&gen_unit_input).small().into_any_element(),
+                    70.0,
+                ))
+                .child(field(
+                    "起始地址",
+                    Input::new(&gen_addr_input).small().into_any_element(),
+                    90.0,
+                ))
+                .child(field(
+                    "数量/长度",
+                    Input::new(&gen_qty_input).small().into_any_element(),
+                    90.0,
+                ));
 
             // Value row (write function codes) + string length.
             let value_row = if is_read {
@@ -2502,7 +2789,11 @@ impl AppView {
                         h_flex()
                             .gap_1()
                             .items_end()
-                            .child(field("写入值", Input::new(&gen_value_input).small().into_any_element(), 220.0))
+                            .child(field(
+                                "写入值",
+                                Input::new(&gen_value_input).small().into_any_element(),
+                                220.0,
+                            ))
                             .when(is_string, |this| {
                                 this.child(field(
                                     "String(N)",
@@ -2552,8 +2843,16 @@ impl AppView {
                 .child(
                     div()
                         .text_size(px(13.))
-                        .text_color(if ok { _cx.theme().green } else { _cx.theme().red })
-                        .child(if ok { pdu_hex.clone() } else { "—".to_string() }),
+                        .text_color(if ok {
+                            _cx.theme().green
+                        } else {
+                            _cx.theme().red
+                        })
+                        .child(if ok {
+                            pdu_hex.clone()
+                        } else {
+                            "—".to_string()
+                        }),
                 )
                 .child(
                     Button::new("copy-pdu")
@@ -2565,7 +2864,9 @@ impl AppView {
                         .on_click({
                             let pdu_hex = pdu_hex.clone();
                             move |_, window, cx| {
-                                cx.write_to_clipboard(gpui::ClipboardItem::new_string(pdu_hex.clone()));
+                                cx.write_to_clipboard(gpui::ClipboardItem::new_string(
+                                    pdu_hex.clone(),
+                                ));
                                 window.push_notification(Notification::info("已复制请求 PDU"), cx);
                             }
                         }),
@@ -2584,8 +2885,16 @@ impl AppView {
                 .child(
                     div()
                         .text_size(px(13.))
-                        .text_color(if ok { _cx.theme().green } else { _cx.theme().red })
-                        .child(if ok { frame_hex.clone() } else { "—".to_string() }),
+                        .text_color(if ok {
+                            _cx.theme().green
+                        } else {
+                            _cx.theme().red
+                        })
+                        .child(if ok {
+                            frame_hex.clone()
+                        } else {
+                            "—".to_string()
+                        }),
                 )
                 .child(
                     Button::new("copy-frame")
@@ -2597,8 +2906,11 @@ impl AppView {
                         .on_click({
                             let frame_hex = frame_hex.clone();
                             move |_, window, cx| {
-                                cx.write_to_clipboard(gpui::ClipboardItem::new_string(frame_hex.clone()));
-                                window.push_notification(Notification::info("已复制完整发送帧"), cx);
+                                cx.write_to_clipboard(gpui::ClipboardItem::new_string(
+                                    frame_hex.clone(),
+                                ));
+                                window
+                                    .push_notification(Notification::info("已复制完整发送帧"), cx);
                             }
                         }),
                 );
@@ -2971,12 +3283,12 @@ impl AppView {
             )
     }
 
-    fn render_content(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_content(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
         let area = self.active_area;
         let len = self.store.read().unwrap().len(area);
         v_flex()
-            .flex_1()
+            .flex_auto()
             .h_full()
             .gap_2()
             .p_3()
@@ -3037,7 +3349,7 @@ impl AppView {
                                 Button::new("rand-area")
                                     .ghost()
                                     .small()
-                                    .label("随机填充")
+                                    .label("随机")
                                     .on_click(cx.listener(|this, _, window, cx| {
                                         this.random_fill(window, cx);
                                     })),
@@ -3046,7 +3358,7 @@ impl AppView {
                                 Button::new("modbus-parse")
                                     .ghost()
                                     .small()
-                                    .label("Modbus 解析")
+                                    .label("解析")
                                     .tooltip("解析 Modbus TCP 帧（16 进制），查看功能码 / 类型 / 字节序 / 按位显示")
                                     .on_click(cx.listener(|this, _, window, cx| {
                                         this.open_parser_dialog(window, cx);
@@ -3056,7 +3368,7 @@ impl AppView {
                                 Button::new("modbus-gen")
                                     .ghost()
                                     .small()
-                                    .label("Modbus 发送")
+                                    .label("生成")
                                     .tooltip("生成 Modbus 请求 / 发送消息（选功能码 / 类型 / 字节序），可复制")
                                     .on_click(cx.listener(|this, _, window, cx| {
                                         this.open_generator_dialog(window, cx);
@@ -3065,12 +3377,14 @@ impl AppView {
                     ),
             )
             .child(
-                Table::new(&self.table)
+                div().h_full().child(Table::new(&self.table)
                     .stripe(true)
                     .bordered(true)
                     .scrollbar_visible(true, true)
-                    .with_size(px(44.)),
+                    .with_size(px(44.)))
             )
+            .child(self.render_log_panel(window, cx))
+            .child(self.render_status_bar(window, cx))
     }
 
     fn render_log_panel(
@@ -3080,17 +3394,13 @@ impl AppView {
     ) -> impl IntoElement {
         let theme = cx.theme();
         let expanded = self.log_expanded.load(Ordering::Relaxed);
-        let entries: Vec<MessageLogEntry> = {
-            let guard = self.logs.read().unwrap();
-            guard.iter().cloned().collect()
-        };
-        let total = entries.len();
+        let total = self.log_table.read(cx).delegate().rows_count(cx);
 
         let header = h_flex()
             .gap_2()
             .items_center()
             .px_2()
-            .h(px(30.))
+            .h(px(40.))
             .border_b_1()
             .border_color(theme.border)
             .bg(theme.sidebar)
@@ -3104,7 +3414,7 @@ impl AppView {
                 div()
                     .text_size(px(12.))
                     .text_color(theme.muted_foreground)
-                    .child("接收 / 发送 · 功能码 · 字节数"),
+                    .child("接收时间 · 方向 · 功能码 · 字节数"),
             )
             .child(div().flex_1())
             .child(
@@ -3135,103 +3445,27 @@ impl AppView {
                     })),
             );
 
-        let body = if expanded && !entries.is_empty() {
-            let rows = entries
-                .iter()
-                .rev()
-                .enumerate()
-                .map(|(i, e)| {
-                    let (dir_color, dir_icon) = match e.direction {
-                        MsgDirection::Received => (theme.blue, IconName::ArrowDown),
-                        MsgDirection::Sent => (theme.green, IconName::ArrowUp),
-                    };
-                    let hex = e.hex.clone();
-                    let time = e.time.clone();
-                    h_flex()
-                        .gap_3()
-                        .items_center()
-                        .px_3()
-                        .py_1()
-                        .border_b_1()
-                        .border_color(theme.border.opacity(0.5))
-                        .child(
-                            div()
-                                .text_size(px(11.))
-                                .text_color(theme.muted_foreground)
-                                .child(time),
-                        )
-                        .child(
-                            h_flex()
-                                .gap_1()
-                                .items_center()
-                                .child(Icon::new(dir_icon).small().text_color(dir_color))
-                                .child(
-                                    div()
-                                        .text_size(px(12.))
-                                        .text_color(dir_color)
-                                        .child(e.direction.label()),
-                                ),
-                        )
-                        .child(
-                            div()
-                                .w(px(64.))
-                                .text_size(px(12.))
-                                .text_color(theme.foreground)
-                                .child(format!("FC {:#04X}", e.function_code)),
-                        )
-                        .child(
-                            div()
-                                .w(px(86.))
-                                .text_size(px(12.))
-                                .text_color(theme.muted_foreground)
-                                .child(format!("{} B · {} 寄存器", e.bytes, e.registers)),
-                        )
-                        .child(
-                            div()
-                                .flex_1()
-                                .text_size(px(11.))
-                                .text_color(theme.foreground)
-                                .child(truncate_hex(&hex, 52)),
-                        )
-                        .child(
-                            Button::new(("copy-log", i))
-                                .ghost()
-                                .xsmall()
-                                .icon(IconName::Copy)
-                                .tooltip("复制完整消息")
-                                .on_click(move |_, window, cx| {
-                                    cx.write_to_clipboard(
-                                        gpui::ClipboardItem::new_string(hex.clone()),
-                                    );
-                                    window.push_notification(
-                                        Notification::info("已复制完整消息到剪贴板"),
-                                        cx,
-                                    );
-                                }),
-                        )
-                })
-                .collect::<Vec<_>>();
-            v_flex()
-                .id("log-body")
-                .max_h(px(220.))
-                .overflow_y_scrollbar()
-                .children(rows)
-                .into_any_element()
-        } else if expanded {
+        let body = if expanded {
             div()
-                .px_3()
-                .py_2()
-                .text_size(px(12.))
-                .text_color(theme.muted_foreground)
-                .child("暂无消息日志 · 启动协议并接收/发送请求后自动记录")
+                .id("log-table")
+                .h(px(220.))
+                .border_b_1()
+                .border_color(theme.border.opacity(0.5))
+                .child(
+                    Table::new(&self.log_table)
+                        .stripe(true)
+                        .bordered(true)
+                        .scrollbar_visible(true, false)
+                        .with_size(px(32.)),
+                )
                 .into_any_element()
         } else {
             div().into_any_element()
         };
 
         v_flex()
-            .flex_shrink_0()
-            .border_t_1()
+            .flex_shrink()
+            .border_1()
             .border_color(theme.border)
             .child(header)
             .child(body)
@@ -3295,8 +3529,6 @@ impl Render for AppView {
             .text_color(theme.foreground)
             .child(self.render_title_bar(window, cx))
             .child(self.render_body(window, cx))
-            .child(self.render_log_panel(window, cx))
-            .child(self.render_status_bar(window, cx))
             .children(Root::render_dialog_layer(window, cx))
             .children(Root::render_notification_layer(window, cx))
     }

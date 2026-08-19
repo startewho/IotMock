@@ -37,8 +37,8 @@ use tokio::{
 use crate::model::{Area, SharedStore};
 
 use super::{
-    log_message, timestamp, MessageLogEntry, MsgDirection, Protocol, ProtocolContext, ServerState,
-    ServerStats, SharedMessageLog,
+    log_message, timestamp, timestamp_ms, MessageLogEntry, MsgDirection, Protocol, ProtocolContext,
+    ServerState, ServerStats, SharedMessageLog,
 };
 
 /// Default Modbus TCP port.
@@ -263,6 +263,7 @@ async fn handle_connection(
                     registers,
                     hex: hex_str(&full),
                     time: timestamp(),
+                    ts_ms: timestamp_ms(),
                 },
             );
         }
@@ -283,6 +284,7 @@ async fn handle_connection(
                 registers: register_count_of_response(&response),
                 hex: hex_str(&out),
                 time: timestamp(),
+                ts_ms: timestamp_ms(),
             },
         );
 

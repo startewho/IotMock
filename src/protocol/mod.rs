@@ -99,6 +99,9 @@ pub struct MessageLogEntry {
     pub hex: String,
     /// `HH:MM:SS` wall-clock time.
     pub time: String,
+    /// Milliseconds since the UNIX epoch. Kept alongside [`Self::time`] so the
+    /// log table can sort entries reliably by generation / receive time.
+    pub ts_ms: u64,
 }
 
 /// Max entries kept in the shared message log (ring buffer).
@@ -132,6 +135,15 @@ pub fn timestamp() -> String {
     let m = (secs / 60) % 60;
     let s = secs % 60;
     format!("{h:02}:{m:02}:{s:02}")
+}
+
+/// Milliseconds since the UNIX epoch (monotonic-enough for log ordering when
+/// combined with the wall-clock [`timestamp`] label).
+pub fn timestamp_ms() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis() as u64)
+        .unwrap_or(0)
 }
 
 /// Server lifecycle state, shown in the UI as a badge.
@@ -239,6 +251,7 @@ mod tests {
                     registers: i,
                     hex: format!("{i:02X}"),
                     time: timestamp(),
+                    ts_ms: timestamp_ms(),
                 },
             );
         }
