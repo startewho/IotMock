@@ -32,7 +32,7 @@ use iot_mock::model::{
     RegisterStore, Row, SharedStore, ValueType, ALL_AREAS, DEFAULT_AREA_SIZE,
 };
 use iot_mock::protocol::{
-    modbus::{ModbusTcpServer, DEFAULT_PORT},
+    modbus::{parse_modbus_hex, ModbusFrameParse, ModbusTcpServer, DEFAULT_PORT},
     ProtocolCard, ProtocolContext, ServerState, ServerStats,
 };
 
@@ -485,6 +485,118 @@ impl BitEditorState {
     }
 }
 
+/// State for the Modbus hex-parse / decode dialog.
+///
+/// Similar to [`BitEditorState`] but purely a viewer/decoder: it holds the
+/// register words extracted from the frame, lets the user pick a type and byte
+/// order, and renders the decoded value plus a bit-wise grid. It never writes
+/// to the shared store.
+pub struct ParserState {
+    /// The active words used for interpretation (length = `type_word_count()`,
+    /// padded/truncated to the type's width).
+    words: Vec<u16>,
+    /// Bit view of `words` (`len * 16` entries), LSB of word 0 first.
+    bits: Vec<bool>,
+    value_type: ValueType,
+    byte_order: ByteOrder,
+    /// `String(N)` byte capacity (only meaningful for `String`).
+    string_chars: usize,
+    /// Last successful parse result (function code + note), if any.
+    info: Option<ModbusFrameParse>,
+    /// Last parse / decode error message, if any.
+    error: Option<String>,
+}
+
+impl ParserState {
+    fn new() -> Self {
+        Self {
+            words: vec![0],
+            bits: vec![false; 16],
+            value_type: ValueType::Uint16,
+            byte_order: ByteOrder::Abcd,
+            string_chars: 7,
+            info: None,
+            error: None,
+        }
+    }
+
+    /// Number of 16-bit words the current type spans.
+    fn type_word_count(&self) -> usize {
+        match self.value_type {
+            ValueType::String => bytes_to_regs(self.string_chars),
+            t => t.fixed_registers().unwrap_or(1),
+        }
+    }
+
+    /// Rebuild the active words (resized to the type's width) and the bit view.
+    fn refresh(&mut self) {
+        let n = self.type_word_count();
+        if self.words.len() < n {
+            self.words.resize(n, 0);
+        }
+        self.words.truncate(n);
+        self.bits = vec![false; n * 16];
+        for (k, &w) in self.words.iter().enumerate() {
+            for i in 0..16 {
+                self.bits[k * 16 + i] = (w >> i) & 1 == 1;
+            }
+        }
+    }
+
+    /// Adopt the register words parsed from a frame.
+    fn set_data(&mut self, words: Vec<u16>) {
+        self.words = words;
+        self.refresh();
+    }
+
+    /// Decode the active words under the current type + byte order.
+    fn decoded(&self) -> String {
+        self.value_type.decode_words(&self.words, self.byte_order)
+    }
+
+    /// Space-separated hex of the active words.
+    fn hex_text(&self) -> String {
+        self.words
+            .iter()
+            .map(|w| format!("{w:04X}"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
+    /// Toggle a single bit and rebuild the words from the bit view.
+    fn toggle_bit(&mut self, ix: usize, on: bool) {
+        if let Some(b) = self.bits.get_mut(ix) {
+            *b = on;
+        }
+        let n = self.type_word_count();
+        self.words = (0..n)
+            .map(|k| {
+                let mut w = 0u16;
+                for i in 0..16 {
+                    if self.bits[k * 16 + i] {
+                        w |= 1 << i;
+                    }
+                }
+                w
+            })
+            .collect();
+    }
+
+    fn set_type(&mut self, vt: ValueType) {
+        self.value_type = vt;
+        self.refresh();
+    }
+
+    fn set_byte_order(&mut self, bo: ByteOrder) {
+        self.byte_order = bo;
+    }
+
+    fn set_string_chars(&mut self, chars: usize) {
+        self.string_chars = chars.clamp(1, 120);
+        self.refresh();
+    }
+}
+
 /// The top-level application view.
 pub struct AppView {
     store: SharedStore,
@@ -504,6 +616,16 @@ pub struct AppView {
     hex_input: Entity<InputState>,
     /// `String(N)` byte-length input in the dialog.
     str_len_input: Entity<InputState>,
+    /// Parser dialog state (Modbus hex decode).
+    parser_state: Entity<ParserState>,
+    /// Type dropdown in the parser dialog.
+    parser_type_select: Entity<SelectState<Vec<ValueTypeItem>>>,
+    /// Byte-order dropdown in the parser dialog.
+    parser_byte_order_select: Entity<SelectState<Vec<ByteOrderItem>>>,
+    /// The raw Modbus frame hex input in the parser dialog.
+    parser_hex_input: Entity<InputState>,
+    /// `String(N)` byte-length input in the parser dialog.
+    parser_str_len_input: Entity<InputState>,
     table: Entity<TableState<RegTableDelegate>>,
     active_area: Area,
     selected_row: Option<usize>,
@@ -577,6 +699,53 @@ impl AppView {
             cx.new(|cx| InputState::new(window, cx).placeholder("十六进制寄存器，如 1234 5678"));
         let str_len_input = cx.new(|cx| InputState::new(window, cx).default_value("7"));
 
+        // Parser dialog: hex input, type/byte-order dropdowns, string length.
+        let parser_state = cx.new(|_| ParserState::new());
+        let parser_type_items = ValueType::ALL
+            .iter()
+            .map(|&v| ValueTypeItem(v))
+            .collect::<Vec<_>>();
+        let parser_type_select = cx.new(|cx| {
+            SelectState::new(
+                parser_type_items,
+                Some(IndexPath::default().row(0)), // Uint16 default
+                window,
+                cx,
+            )
+        });
+        let parser_order_items = ByteOrder::ALL
+            .iter()
+            .map(|&b| ByteOrderItem(b))
+            .collect::<Vec<_>>();
+        let parser_byte_order_select = cx.new(|cx| {
+            SelectState::new(
+                parser_order_items,
+                Some(IndexPath::default().row(0)), // ABCD default
+                window,
+                cx,
+            )
+        });
+        let parser_hex_input = cx.new(|cx| {
+            InputState::new(window, cx)
+                .placeholder("粘贴 Modbus TCP 帧十六进制，如 0001 0000 0005 01 03 02 12 34")
+                .default_value("0001 0000 0005 01 03 02 12 34")
+        });
+        let parser_str_len_input = cx.new(|cx| InputState::new(window, cx).default_value("7"));
+        // Pre-parse the default example right away.
+        {
+            let hex = parser_hex_input.read(cx).value().to_string();
+            match parse_modbus_hex(&hex) {
+                Ok(info) => {
+                    parser_state.update(cx, |s, _| {
+                        s.set_data(info.words.clone());
+                        s.info = Some(info);
+                        s.error = None;
+                    });
+                }
+                Err(e) => parser_state.update(cx, |s, _| s.error = Some(e)),
+            }
+        }
+
         let auto_sim = Arc::new(AtomicBool::new(true));
 
         let mut subscriptions = Vec::new();
@@ -623,6 +792,55 @@ impl AppView {
             },
         ));
 
+        // Parser: re-parse the frame when the hex input changes.
+        subscriptions.push(cx.subscribe_in(
+            &parser_hex_input,
+            window,
+            |this, _inp, event, window, cx| {
+                if let gpui_component::input::InputEvent::Change = event {
+                    this.parse_hex_into_parser(window, cx);
+                    window.refresh();
+                }
+            },
+        ));
+        // Parser: value-type change.
+        subscriptions.push(cx.subscribe_in(
+            &parser_type_select,
+            window,
+            |this, _sel, event, window, cx| {
+                if let gpui_component::select::SelectEvent::Confirm(Some(vt)) = event {
+                    this.parser_state.update(cx, |s, _| s.set_type(*vt));
+                    this.parser_sync_inputs(window, cx);
+                    window.refresh();
+                }
+            },
+        ));
+        // Parser: byte-order change.
+        subscriptions.push(cx.subscribe_in(
+            &parser_byte_order_select,
+            window,
+            |this, _sel, event, window, cx| {
+                if let gpui_component::select::SelectEvent::Confirm(Some(bo)) = event {
+                    this.parser_state.update(cx, |s, _| s.set_byte_order(*bo));
+                    window.refresh();
+                }
+            },
+        ));
+        // Parser: `String(N)` length change.
+        subscriptions.push(cx.subscribe_in(
+            &parser_str_len_input,
+            window,
+            |this, _sel, event, window, cx| {
+                if let gpui_component::input::InputEvent::Change = event {
+                    let text = this.parser_str_len_input.read(cx).value().to_string();
+                    let n = text.trim().parse::<usize>().unwrap_or(7);
+                    this.parser_state.update(cx, |s, _| s.set_string_chars(n));
+                    this.parser_sync_inputs(window, cx);
+                    window.refresh();
+                }
+            },
+        ));
+
         // -- real-time refresh loop -------------------------------------------
         // Every REFRESH_MS: (optionally) auto-simulate, then push a fresh
         // snapshot of the active area into the table delegate.
@@ -661,6 +879,11 @@ impl AppView {
             str_input,
             hex_input,
             str_len_input,
+            parser_state,
+            parser_type_select,
+            parser_byte_order_select,
+            parser_hex_input,
+            parser_str_len_input,
             table,
             active_area: Area::HoldingRegisters,
             selected_row: None,
@@ -1390,6 +1613,293 @@ impl AppView {
         });
     }
 
+    /// Parse the current parser hex input into `parser_state`.
+    fn parse_hex_into_parser(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let hex = self.parser_hex_input.read(cx).value().to_string();
+        match parse_modbus_hex(&hex) {
+            Ok(info) => {
+                self.parser_state.update(cx, |s, _| {
+                    s.set_data(info.words.clone());
+                    s.info = Some(info);
+                    s.error = None;
+                });
+            }
+            Err(e) => self.parser_state.update(cx, |s, _| s.error = Some(e)),
+        }
+        self.parser_sync_inputs(window, cx);
+    }
+
+    /// Keep the parser's `String(N)` length input in sync with its state.
+    fn parser_sync_inputs(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let is_string = self.parser_state.read(cx).value_type == ValueType::String;
+        if is_string {
+            let len = self.parser_state.read(cx).string_chars.to_string();
+            let inp = self.parser_str_len_input.clone();
+            self.set_input_if_changed(&inp, &len, window, cx);
+        }
+    }
+
+    /// Open the Modbus hex-parse / decode dialog.
+    fn open_parser_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let parser_state = self.parser_state.clone();
+        let parser_type_select = self.parser_type_select.clone();
+        let parser_byte_order_select = self.parser_byte_order_select.clone();
+        let parser_hex_input = self.parser_hex_input.clone();
+        let parser_str_len_input = self.parser_str_len_input.clone();
+
+        window.open_dialog(cx, move |dialog, _window, _cx| {
+            let ps = parser_state.read(_cx);
+            let vt = ps.value_type;
+            let is_string = vt == ValueType::String;
+            let nbits = ps.bits.len().min(64);
+            let decoded = ps.decoded();
+            let words_hex = ps.hex_text();
+            let word_count = ps.words.len();
+            let error = ps.error.clone();
+            let info = ps.info.as_ref();
+
+            // --- hex input row + parse button ---------------------------------
+            let hex_row = h_flex()
+                .gap_2()
+                .items_center()
+                .child(div().flex_1().child(Input::new(&parser_hex_input).flex_1()))
+                .child(
+                    Button::new("parse-now")
+                        .small()
+                        .primary()
+                        .label("解析")
+                        .on_click({
+                            let ps = parser_state.clone();
+                            let phx = parser_hex_input.clone();
+                            move |_, window, cx| {
+                                let hex = phx.read(cx).value().to_string();
+                                match parse_modbus_hex(&hex) {
+                                    Ok(info) => ps.update(cx, |s, _| {
+                                        s.set_data(info.words.clone());
+                                        s.info = Some(info);
+                                        s.error = None;
+                                    }),
+                                    Err(e) => ps.update(cx, |s, _| s.error = Some(e)),
+                                }
+                                window.refresh();
+                            }
+                        }),
+                );
+
+            // --- header: MBAP fields + function code -------------------------
+            let header = v_flex()
+                .gap_1()
+                .p_2()
+                .rounded(_cx.theme().radius)
+                .border_1()
+                .border_color(_cx.theme().border)
+                .child(
+                    h_flex()
+                        .gap_4()
+                        .items_center()
+                        .child(
+                            div()
+                                .text_size(px(12.))
+                                .text_color(_cx.theme().muted_foreground)
+                                .child(format!(
+                                    "事务 {} · 协议 {} · 长度 {} · 单元 {}",
+                                    info.map(|i| format!("{:#06X}", i.tx_id)).unwrap_or_default(),
+                                    info.map(|i| format!("{:#06X}", i.proto_id)).unwrap_or_default(),
+                                    info.map(|i| i.length.to_string()).unwrap_or_default(),
+                                    info.map(|i| i.unit_id.to_string()).unwrap_or_else(|| "—".into()),
+                                )),
+                        ),
+                )
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .items_center()
+                        .child(
+                            div()
+                                .text_size(px(13.))
+                                .font_weight(gpui::FontWeight::SEMIBOLD)
+                                .child(
+                                    info.map(|i| format!("功能码 {:#04X}", i.function_code))
+                                        .unwrap_or_else(|| "功能码 —".to_string()),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(12.))
+                                .text_color(_cx.theme().primary)
+                                .child(info.map(|i| i.name).unwrap_or_default()),
+                        ),
+                )
+                .when(error.is_none(), |this| {
+                    this.child(
+                        div()
+                            .text_size(px(12.))
+                            .text_color(_cx.theme().muted_foreground)
+                            .child(info.map(|i| i.note.clone()).unwrap_or_default()),
+                    )
+                })
+                .when(error.is_some(), |this| {
+                    this.child(
+                        div()
+                            .text_size(px(12.))
+                            .text_color(_cx.theme().red)
+                            .child(error.clone().unwrap_or_default()),
+                    )
+                });
+
+            // --- value type / byte order / string length controls ------------
+            let controls = h_flex()
+                .gap_3()
+                .items_center()
+                .child(
+                    h_flex()
+                        .gap_1()
+                        .items_center()
+                        .child(
+                            div()
+                                .text_size(px(12.))
+                                .text_color(_cx.theme().muted_foreground)
+                                .child("类型"),
+                        )
+                        .child(Select::new(&parser_type_select).small().menu_width(gpui::rems(11.))),
+                )
+                .child(
+                    h_flex()
+                        .gap_1()
+                        .items_center()
+                        .child(
+                            div()
+                                .text_size(px(12.))
+                                .text_color(_cx.theme().muted_foreground)
+                                .child("字节序"),
+                        )
+                        .child(
+                            Select::new(&parser_byte_order_select)
+                                .small()
+                                .menu_width(gpui::rems(18.)),
+                        ),
+                )
+                .child(div().flex_1())
+                .when(is_string, |this| {
+                    this.child(
+                        h_flex()
+                            .gap_1()
+                            .items_center()
+                            .child(
+                                div()
+                                    .text_size(px(12.))
+                                    .text_color(_cx.theme().muted_foreground)
+                                    .child("String(N)"),
+                            )
+                            .child(div().w(px(64.)).child(Input::new(&parser_str_len_input).small())),
+                    )
+                });
+
+            // --- decoded value + hex words -----------------------------------
+            let value_line = h_flex()
+                .gap_2()
+                .items_center()
+                .child(
+                    div()
+                        .text_size(px(12.))
+                        .text_color(_cx.theme().muted_foreground)
+                        .child(format!("{} 寄存器 · 值 =", word_count)),
+                )
+                .child(
+                    div()
+                        .text_size(px(15.))
+                        .font_weight(gpui::FontWeight::BOLD)
+                        .text_color(_cx.theme().green)
+                        .child(decoded),
+                )
+                .child(div().flex_1())
+                .child(
+                    div()
+                        .text_size(px(13.))
+                        .text_color(_cx.theme().muted_foreground)
+                        .child(words_hex),
+                );
+
+            // --- bit-wise grid (max 8 per row) -------------------------------
+            let bit_rows = (0..nbits)
+                .collect::<Vec<_>>()
+                .chunks(8)
+                .map(|chunk| {
+                    h_flex()
+                        .gap_2()
+                        .justify_center()
+                        .items_center()
+                        .children(chunk.iter().map(|&i| {
+                            let ps = parser_state.clone();
+                            div()
+                                .flex_row()
+                                .content_center()
+                                .w_16()
+                                .child(
+                                    Checkbox::new(gpui::SharedString::from(format!("parbit-{i}")))
+                                        .small()
+                                        .checked(ps.read(_cx).bits[i])
+                                        .on_click(move |&on, window, cx| {
+                                            ps.update(cx, |s, _| s.toggle_bit(i, on));
+                                            window.refresh();
+                                        }),
+                                )
+                                .text_color(_cx.theme().muted_foreground)
+                                .child(i.to_string())
+                        }))
+                })
+                .collect::<Vec<_>>();
+
+            let grid_label = h_flex()
+                .justify_between()
+                .child(
+                    div()
+                        .text_size(px(12.))
+                        .text_color(_cx.theme().muted_foreground)
+                        .child("按位查看（每行 8 位，bit0 = 最低位）"),
+                )
+                .child(
+                    div()
+                        .text_size(px(12.))
+                        .text_color(_cx.theme().muted_foreground)
+                        .child(format!("{} 位", nbits)),
+                );
+
+            dialog
+                .title("Modbus 协议解析 (16 进制)".to_string())
+                .width(px(680.))
+                .child(
+                    v_flex()
+                        .gap_3()
+                        .px_2()
+                        .child(hex_row)
+                        .child(header)
+                        .child(controls)
+                        .child(value_line)
+                        .child(grid_label)
+                        .child(
+                            v_flex()
+                                .gap_2()
+                                .border_1()
+                                .border_color(_cx.theme().border)
+                                .rounded(_cx.theme().radius)
+                                .p_3()
+                                .children(bit_rows),
+                        )
+                        .child(
+                            div()
+                                .text_size(px(12.))
+                                .text_color(_cx.theme().muted_foreground)
+                                .child("在功能码方框粘贴完整 Modbus TCP 帧（MBAP + PDU）十六进制，可解析功能码并选择类型 / 字节序查看值及按位显示"),
+                        ),
+                )
+                .on_ok(move |_, window, cx| {
+                    window.close_dialog(cx);
+                    true
+                })
+        });
+    }
+
     // -----------------------------------------------------------------------
     // Rendering
     // -----------------------------------------------------------------------
@@ -1800,6 +2310,16 @@ impl AppView {
                                     .label("随机填充")
                                     .on_click(cx.listener(|this, _, window, cx| {
                                         this.random_fill(window, cx);
+                                    })),
+                            )
+                            .child(
+                                Button::new("modbus-parse")
+                                    .ghost()
+                                    .small()
+                                    .label("Modbus 解析")
+                                    .tooltip("解析 Modbus TCP 帧（16 进制），查看功能码 / 类型 / 字节序 / 按位显示")
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.open_parser_dialog(window, cx);
                                     })),
                             ),
                     ),

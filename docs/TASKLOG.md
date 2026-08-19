@@ -132,6 +132,30 @@
 - 表 `render_td` 的 `match` 各分支需同类型（`Div`）→ 位列的 `if/else` 两分支都不要 `into_any_element()`（内层 `mk_bit` helper 返回 `AnyElement` 作为子元素即可）。
 - `render_td` 需带实时值读取，需给 delegate 注入 `SharedStore`（在 `AppView::new` 创建表时 `RegTableDelegate::new(store.clone())`）。
 
+### ✅ 已完成：阶段六 — Modbus 协议(16进制)解析弹框
+
+用户新增需求（本次会话）：
+
+> 主界面添加一个解析 Modbus 协议（16 进制）的弹框，类似数据编辑框：显示功能码，可根据协议内容选择 Int16/Float/String，切换字节序显示对应值，同样显示按位功能。
+
+| # | 任务 | 说明 | 状态 |
+|---|------|------|------|
+| 1 | 帧解析逻辑 | `protocol/modbus.rs` 新增 `parse_modbus_hex` + `ModbusFrameParse`：解析 MBAP（事务/协议/长度/单元）+ 功能码，用 `length` 字段区分请求/响应并提取寄存器数据字 | ✅ |
+| 2 | 解析单元测试 | FC 0x03 响应/请求、0x06、0x10 请求、0x01 线圈、短帧/非法/奇数长度拒绝 | ✅ 全绿 |
+| 3 | 解析器状态 | `ParserState`：`words`/`bits`/`value_type`/`byte_order`/`string_chars`/`info`/`error`；`decode_words` 复用类型+字节序解释，`toggle_bit` 按位重算 | ✅ |
+| 4 | 解析器实体 | AppView 新增 `parser_state`、`parser_type_select`、`parser_byte_order_select`、`parser_hex_input`、`parser_str_len_input`，默认示例帧预解析 | ✅ |
+| 5 | 订阅联动 | hex 输入 `Change` 自动解析；类型/字节序 `Confirm`、String(N) `Change` 更新解析器并 `window.refresh()` 刷新 | ✅ |
+| 6 | 弹框渲染 | 主界面「Modbus 解析」按钮打开：hex 输入+解析按钮、MBAP+功能码+结构说明头、类型/字节序/String(N) 选择、解码值+hex 字、按位网格（最多 8 位一行） | ✅ |
+| 7 | 构建/测试/验证 | `cargo build` 无警告；31 单测 + 1 集成全绿 | ✅ |
+| 8 | 文档 | `README.md` 补充 Modbus 解析弹框说明 | ✅ |
+
+**踩坑记录：**
+- `open_dialog` 的内容闭包是 `Fn`（每次渲染重新调用）→ 内部 `move` 闭包不能直接消费外层实体，需先 `let phx = parser_hex_input.clone();` 再移入。
+- 帧解析需用 MBAP `length` 字段区分请求（length=6，无数据）与响应（length=3+字节数）以及 0x10 请求/响应。
+- 位复选框 id 用 `SharedString::from(format!("parbit-{i}"))` 避免跨渲染冲突。
+- 解析器为纯查看/解码器，不写共享 store（与编辑弹窗不同）。
+
+
 ### ⏳ 计划中：后续阶段（可选）
 
 - [ ] 扩展 S7 协议（实现 `Protocol` trait 并注册）
@@ -184,3 +208,6 @@ BADC `[0x3412, 0x7856]`；DCBA `[0x7856, 0x3412]`。
 | 阶段四完成 | `cargo test --lib model::tests` | 18 通过 / 0 失败 |
 | 阶段五完成 | `cargo build` | 无警告 |
 | 阶段五完成 | `cargo test` | 26 通过 / 0 失败（25 单测 + 1 集成） |
+| 阶段六完成 | `cargo build` | 无警告 |
+| 阶段六完成 | `cargo test` | 32 通过 / 0 失败（31 单测 + 1 集成） |
+| 阶段六完成 | `cargo test --lib protocol::modbus` | 含 6 个新增解析用例 |

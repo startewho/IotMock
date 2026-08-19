@@ -157,6 +157,25 @@ impl ByteOrder {
             }
         }
     }
+
+    /// Encode a 64-bit value into the four 16-bit register words using this byte
+    /// order. The 32-bit order is applied independently to the high and low
+    /// 32-bit halves (each occupying two consecutive registers).
+    pub fn encode_u64(self, value: u64) -> [u16; 4] {
+        let hi = value >> 32;
+        let lo = value & 0xFFFF_FFFF;
+        let [a, b] = self.encode_u32(hi as u32);
+        let [c, d] = self.encode_u32(lo as u32);
+        [a, b, c, d]
+    }
+
+    /// Decode four 16-bit register words back into a 64-bit value using this
+    /// byte order (inverse of [`ByteOrder::encode_u64`]).
+    pub fn decode_u64(self, words: [u16; 4]) -> u64 {
+        let hi = self.decode_u32([words[0], words[1]]) as u64;
+        let lo = self.decode_u32([words[2], words[3]]) as u64;
+        (hi << 32) | lo
+    }
 }
 
 /// A typed interpretation of one or more registers, used by the edit dialog to
@@ -175,17 +194,26 @@ pub enum ValueType {
     Int32,
     /// 32-bit IEEE-754 float (2 registers).
     Float32,
+    /// 64-bit unsigned (4 registers).
+    Uint64,
+    /// 64-bit signed (4 registers).
+    Int64,
+    /// 64-bit IEEE-754 double (4 registers).
+    Double,
     /// UTF-8 string packed 2 bytes per register (variable register count).
     String,
 }
 
 impl ValueType {
-    pub const ALL: [ValueType; 6] = [
+    pub const ALL: [ValueType; 9] = [
         ValueType::Uint16,
         ValueType::Int16,
         ValueType::Uint32,
         ValueType::Int32,
         ValueType::Float32,
+        ValueType::Uint64,
+        ValueType::Int64,
+        ValueType::Double,
         ValueType::String,
     ];
 
@@ -196,6 +224,9 @@ impl ValueType {
             ValueType::Uint32 => "UInt32",
             ValueType::Int32 => "Int32",
             ValueType::Float32 => "Float32",
+            ValueType::Uint64 => "UInt64",
+            ValueType::Int64 => "Int64",
+            ValueType::Double => "Double",
             ValueType::String => "String",
         }
     }
@@ -207,6 +238,9 @@ impl ValueType {
             ValueType::Uint32 => "无符号32位整数",
             ValueType::Int32 => "有符号32位整数",
             ValueType::Float32 => "32位浮点数",
+            ValueType::Uint64 => "无符号64位整数",
+            ValueType::Int64 => "有符号64位整数",
+            ValueType::Double => "64位双精度浮点数",
             ValueType::String => "字符串 / 字符",
         }
     }
@@ -217,6 +251,7 @@ impl ValueType {
         match self {
             ValueType::Uint16 | ValueType::Int16 => Some(1),
             ValueType::Uint32 | ValueType::Int32 | ValueType::Float32 => Some(2),
+            ValueType::Uint64 | ValueType::Int64 | ValueType::Double => Some(4),
             ValueType::String => None,
         }
     }
@@ -260,6 +295,21 @@ impl ValueType {
                 }
                 Ok(byte_order.encode_u32(v.to_bits()).to_vec())
             }
+            ValueType::Uint64 => {
+                let v: u64 = text.trim().parse().map_err(|_| "无效的 UInt64 数值".to_string())?;
+                Ok(byte_order.encode_u64(v).to_vec())
+            }
+            ValueType::Int64 => {
+                let v: i64 = text.trim().parse().map_err(|_| "无效的 Int64 数值".to_string())?;
+                Ok(byte_order.encode_u64(v as u64).to_vec())
+            }
+            ValueType::Double => {
+                let v: f64 = text.trim().parse().map_err(|_| "无效的 Double 数值".to_string())?;
+                if !v.is_finite() {
+                    return Err("浮点数必须为有限值".to_string());
+                }
+                Ok(byte_order.encode_u64(v.to_bits()).to_vec())
+            }
             ValueType::String => store_string(text, byte_order, max_regs),
         }
     }
@@ -275,6 +325,12 @@ impl ValueType {
             ValueType::Float32 => {
                 let bits = byte_order.decode_u32([words[0], words[1]]);
                 f32::from_bits(bits).to_string()
+            }
+            ValueType::Uint64 => byte_order.decode_u64([words[0], words[1], words[2], words[3]]).to_string(),
+            ValueType::Int64 => (byte_order.decode_u64([words[0], words[1], words[2], words[3]]) as i64).to_string(),
+            ValueType::Double => {
+                let bits = byte_order.decode_u64([words[0], words[1], words[2], words[3]]);
+                f64::from_bits(bits).to_string()
             }
             ValueType::String => load_string(words, byte_order),
         }

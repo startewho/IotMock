@@ -477,6 +477,190 @@ fn writer(_uid: u8) -> String {
     "Modbus TCP".to_string()
 }
 
+/// A parsed Modbus TCP frame used by the hex-decoder dialog.
+#[derive(Clone, Debug)]
+pub struct ModbusFrameParse {
+    /// MBAP transaction id.
+    pub tx_id: u16,
+    /// MBAP protocol id (0 for Modbus).
+    pub proto_id: u16,
+    /// MBAP length (bytes following the length field).
+    pub length: u16,
+    /// MBAP unit id.
+    pub unit_id: u8,
+    /// Function code.
+    pub function_code: u8,
+    /// Human-readable function code name.
+    pub name: &'static str,
+    /// Fix of the request/response structure (e.g. `请求：起始地址 0，数量 1`).
+    pub note: String,
+    /// Register data words extracted from the payload (empty for pure requests).
+    pub words: Vec<u16>,
+}
+
+/// Human-readable name for a Modbus function code.
+pub fn function_code_name(fc: u8) -> &'static str {
+    match fc {
+        0x01 => "读线圈 (Read Coils)",
+        0x02 => "读离散输入 (Read Discrete Inputs)",
+        0x03 => "读保持寄存器 (Read Holding Registers)",
+        0x04 => "读输入寄存器 (Read Input Registers)",
+        0x05 => "写单个线圈 (Write Single Coil)",
+        0x06 => "写单个寄存器 (Write Single Register)",
+        0x0F => "写多个线圈 (Write Multiple Coils)",
+        0x10 => "写多个寄存器 (Write Multiple Registers)",
+        _ => "未知功能码",
+    }
+}
+
+/// Interpret big-endian bytes as 16-bit register words (drops a trailing odd byte).
+fn bytes_to_words(data: &[u8]) -> Vec<u16> {
+    data.chunks_exact(2)
+        .map(|c| u16::from_be_bytes([c[0], c[1]]))
+        .collect()
+}
+
+/// Parse a whitespace / `0x`-separable hex string of a full Modbus TCP frame
+/// (MBAP 7 bytes + PDU) into its header fields, function code and register data.
+///
+/// The MBAP `length` field is used to tell a *request* from a *response* and to
+/// locate the register data region. Returns an error for malformed input.
+pub fn parse_modbus_hex(hex: &str) -> Result<ModbusFrameParse, String> {
+    let mut cleaned = String::new();
+    for c in hex.chars() {
+        if c.is_ascii_hexdigit() {
+            cleaned.push(c);
+        } else if c.is_whitespace() || c == 'x' || c == 'X' {
+            continue;
+        } else {
+            return Err("包含非十六进制字符".to_string());
+        }
+    }
+    if cleaned.is_empty() {
+        return Err("请输入十六进制数据".to_string());
+    }
+    if !cleaned.len().is_multiple_of(2) {
+        return Err("十六进制长度必须为偶数".to_string());
+    }
+    let bytes: Vec<u8> = (0..cleaned.len() / 2)
+        .map(|i| {
+            u8::from_str_radix(&cleaned[i * 2..i * 2 + 2], 16)
+                .map_err(|_| "非法十六进制".to_string())
+        })
+        .collect::<Result<_, _>>()?;
+    if bytes.len() < 8 {
+        return Err("帧过短：至少需要 MBAP(7 字节) + 功能码(1 字节)".to_string());
+    }
+    let tx_id = u16::from_be_bytes([bytes[0], bytes[1]]);
+    let proto_id = u16::from_be_bytes([bytes[2], bytes[3]]);
+    let length = u16::from_be_bytes([bytes[4], bytes[5]]);
+    let unit_id = bytes[6];
+    let fc = bytes[7];
+    let name = function_code_name(fc);
+    let (note, words) = parse_payload(&bytes, fc, length as usize);
+    Ok(ModbusFrameParse {
+        tx_id,
+        proto_id,
+        length,
+        unit_id,
+        function_code: fc,
+        name,
+        note,
+        words,
+    })
+}
+
+/// Extract the frame structure note and register data words from the payload.
+fn parse_payload(bytes: &[u8], fc: u8, length: usize) -> (String, Vec<u16>) {
+    let payload = &bytes[8..];
+    match fc {
+        0x03 | 0x04 => {
+            let area = if fc == 0x03 { "保持" } else { "输入" };
+            if length == 6 {
+                // request: start address + quantity, no data
+                let addr = u16::from_be_bytes([bytes[8], bytes[9]]);
+                let qty = u16::from_be_bytes([bytes[10], bytes[11]]);
+                (format!("请求：起始地址 {addr}，数量 {qty}"), vec![])
+            } else {
+                // response: byte count = length - 3, data starts at [9]
+                let bc = length.saturating_sub(3);
+                let data = &bytes[9..(9 + bc).min(bytes.len())];
+                let words = bytes_to_words(data);
+                (
+                    format!("响应：{bc} 字节 = {} 个寄存器（{area}寄存器）", words.len()),
+                    words,
+                )
+            }
+        }
+        0x06 => {
+            let v = u16::from_be_bytes([bytes[10], bytes[11]]);
+            (
+                format!("写单个寄存器：值 0x{v:04X}（16 位）"),
+                vec![v],
+            )
+        }
+        0x05 => {
+            let v = u16::from_be_bytes([bytes[10], bytes[11]]);
+            let s = if v == 0xFF00 {
+                "ON"
+            } else if v == 0x0000 {
+                "OFF"
+            } else {
+                "非法线圈值"
+            };
+            (format!("写单个线圈：{s} (0x{v:04X})"), vec![v])
+        }
+        0x10 => {
+            let qty = u16::from_be_bytes([bytes[10], bytes[11]]);
+            if length == 6 {
+                // response: start address + quantity
+                (format!("响应：已写入 {qty} 个寄存器"), vec![])
+            } else {
+                // request: start addr, qty, byte count at [12], data from [13]
+                let bc = bytes.get(12).copied().unwrap_or(0) as usize;
+                let data = &bytes[13..(13 + bc).min(bytes.len())];
+                let words = bytes_to_words(data);
+                (
+                    format!("请求：起始地址 {}，数量 {qty}，{bc} 字节数据", u16::from_be_bytes([bytes[8], bytes[9]])),
+                    words,
+                )
+            }
+        }
+        0x01 | 0x02 => {
+            let area = if fc == 0x01 { "线圈" } else { "离散输入" };
+            if length == 6 {
+                let addr = u16::from_be_bytes([bytes[8], bytes[9]]);
+                let qty = u16::from_be_bytes([bytes[10], bytes[11]]);
+                (format!("请求：起始地址 {addr}，数量 {qty}"), vec![])
+            } else {
+                let bc = length.saturating_sub(3);
+                let data = &bytes[9..(9 + bc).min(bytes.len())];
+                // Packed bit bytes: expose each byte as a word so the bit view shows them.
+                let words = data.iter().map(|&b| b as u16).collect::<Vec<_>>();
+                (format!("响应：位数据 {bc} 字节（{area}）"), words)
+            }
+        }
+        0x0F => {
+            let qty = u16::from_be_bytes([bytes[10], bytes[11]]);
+            if length == 6 {
+                (format!("响应：已写入 {qty} 个线圈"), vec![])
+            } else {
+                let bc = bytes.get(12).copied().unwrap_or(0) as usize;
+                let data = &bytes[13..(13 + bc).min(bytes.len())];
+                let words = data.iter().map(|&b| b as u16).collect::<Vec<_>>();
+                (format!("请求：数量 {qty}，{bc} 字节位数据"), words)
+            }
+        }
+        _ => {
+            let words = bytes_to_words(payload);
+            (
+                format!("数据区：{} 个寄存器（按原始字节解析）", words.len()),
+                words,
+            )
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -545,5 +729,57 @@ mod tests {
         let resp = process_pdu(&pdu, &store, &ServerStats::default());
         assert_eq!(resp, vec![0x05, 0x00, 0x0A, 0xFF, 0x00]);
         assert_eq!(store.read().unwrap().get(Area::Coils, 10), Some(1));
+    }
+
+    #[test]
+    fn parse_read_holding_registers_response() {
+        let p = parse_modbus_hex("0001 0000 0007 01 03 04 12 34 56 78").unwrap();
+        assert_eq!(p.tx_id, 0x0001);
+        assert_eq!(p.proto_id, 0);
+        assert_eq!(p.length, 7);
+        assert_eq!(p.unit_id, 1);
+        assert_eq!(p.function_code, 0x03);
+        assert!(p.name.contains("读保持寄存器"));
+        assert_eq!(p.words, vec![0x1234, 0x5678]);
+    }
+
+    #[test]
+    fn parse_read_registers_request_no_data() {
+        let p = parse_modbus_hex("0001 0000 0006 01 03 000B 0001").unwrap();
+        assert_eq!(p.function_code, 0x03);
+        assert!(p.words.is_empty());
+        assert!(p.note.contains("起始地址"));
+        assert_eq!(p.length, 6);
+    }
+
+    #[test]
+    fn parse_write_single_register_value() {
+        let p = parse_modbus_hex("0001000000060106000A1234").unwrap();
+        assert_eq!(p.function_code, 0x06);
+        assert_eq!(p.words, vec![0x1234]);
+    }
+
+    #[test]
+    fn parse_write_multiple_registers_request() {
+        let p = parse_modbus_hex("0001 0000 000B 01 10 000A 0002 04 1234 5678").unwrap();
+        assert_eq!(p.function_code, 0x10);
+        assert_eq!(p.words, vec![0x1234, 0x5678]);
+        assert!(p.note.contains("数量 2"));
+    }
+
+    #[test]
+    fn parse_read_coils_response_bit_bytes() {
+        let p = parse_modbus_hex("0001000000050101028101").unwrap();
+        assert_eq!(p.function_code, 0x01);
+        // each packed bit byte surfaces as a word: 0x81, 0x01
+        assert_eq!(p.words, vec![0x0081, 0x0001]);
+    }
+
+    #[test]
+    fn parse_rejects_short_and_bad_frames() {
+        assert!(parse_modbus_hex("0103").is_err());        // too short
+        assert!(parse_modbus_hex("xyz").is_err());          // bad chars
+        assert!(parse_modbus_hex("00010000000601030").is_err()); // odd length
+        assert!(parse_modbus_hex("").is_err());             // empty
     }
 }
