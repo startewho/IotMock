@@ -155,6 +155,32 @@
 - 位复选框 id 用 `SharedString::from(format!("parbit-{i}"))` 避免跨渲染冲突。
 - 解析器为纯查看/解码器，不写共享 store（与编辑弹窗不同）。
 
+### ✅ 已完成：阶段七 — 解析自动匹配 + Int64/UInt64/Double 类型
+
+用户新增需求（本次会话）：
+
+> 1. 协议解析添加自动匹配字节序按钮：数字类型值需在 0~10000（范围可改）；String 匹配字符解析出有效 ANSI/ASCII（不含中文）。
+> 2. 协议解析按返回字节数默认选择类型：2 字节→Int16，4 字节→Int32，8 字节→Int64。
+> 3. 添加 Int64/UInt64/Double 数据类型支持。
+
+| # | 任务 | 说明 | 状态 |
+|---|------|------|------|
+| 1 | 64 位字节序 | `ByteOrder` 新增 `encode_u64` / `decode_u64`（按 32 位半字独立套用字节序），4 寄存器 | ✅ |
+| 2 | 数据类型扩展 | `ValueType` 新增 `Uint64` / `Int64` / `Double`（4 寄存器），更新 `ALL`/`label`/`fixed_registers`/`encode_text`/`decode_words`；编辑弹窗与解析器同步支持 | ✅ |
+| 3 | 模型单元测试 | `encode_u64`/`decode_u64` 全字节序往返、连线模式、64 位类型字宽、UInt64/Int64/Double 全字节序往返 | ✅ 全绿 |
+| 4 | 自动匹配类型 | 解析时按 `words.len()*2` 字节数默认选择（2→Int16、4→Int32、8→Int64），更新解析器状态与类型下拉；另有「自动匹配类型」按钮 | ✅ |
+| 5 | 范围输入 | `parser_range_input`（默认 10000）数字类型显示，自动匹配字节序时读取 | ✅ |
+| 6 | 自动匹配字节序 | `match_byte_order`/`numeric_value`/`string_bytes`/`valid_ansi_bytes`：数字值 ∈ [0,范围]，String 解析有效 **ANSI/ASCII**（0x20–0x7E，排除中文等多字节；按 ALL 顺序优先 ABCD） | ✅ |
+| 7 | 对话框按钮 | 「自动匹配类型」「自动匹配字节序」按钮 + 范围输入 + 规则提示 | ✅ |
+| 8 | 构建/测试/验证 | `cargo build` 无警告；35 单测 + 1 集成全绿 | ✅ |
+| 9 | 文档 | `README.md` 更新解析器类型与自动匹配说明 | ✅ |
+
+**踩坑记录：**
+- 自动匹配逻辑在对话框内联闭包实现（`open_dialog` 闭包无法访问 `&mut AppView`），入参实体需先 clone。
+- 预解析/`parse_hex_into_parser` 中在 `parser_state.update` 闭包内再调 `type_select.update` 会双向借用 `cx` → 先算 `vt` 到局部、在 update 闭包外另设类型下拉。
+- `encode_u64` 采用「每个 32 位半字独立套字节序」约定：CDAB 高半=字交换、低半=字交换，需与测试预期一致。
+
+
 
 ### ⏳ 计划中：后续阶段（可选）
 
@@ -211,3 +237,5 @@ BADC `[0x3412, 0x7856]`；DCBA `[0x7856, 0x3412]`。
 | 阶段六完成 | `cargo build` | 无警告 |
 | 阶段六完成 | `cargo test` | 32 通过 / 0 失败（31 单测 + 1 集成） |
 | 阶段六完成 | `cargo test --lib protocol::modbus` | 含 6 个新增解析用例 |
+| 阶段七完成 | `cargo build` | 无警告 |
+| 阶段七完成 | `cargo test` | 36 通过 / 0 失败（35 单测 + 1 集成） |

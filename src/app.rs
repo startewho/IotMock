@@ -103,6 +103,90 @@ fn parse_hex_words(text: &str) -> Result<Vec<u16>, String> {
     Ok(words)
 }
 
+/// Default type for a given number of data bytes (2->Int16, 4->Int32, 8->Int64).
+fn type_for_byte_count(bytes: usize) -> ValueType {
+    match bytes {
+        2 => ValueType::Int16,
+        4 => ValueType::Int32,
+        8 => ValueType::Int64,
+        _ => ValueType::Int16,
+    }
+}
+
+/// Numerically interpret `words` under `bo` as `f64`, for byte-order range checks.
+fn numeric_value(vt: ValueType, words: &[u16], bo: ByteOrder) -> Option<f64> {
+    let need = vt.fixed_registers().unwrap_or(1);
+    if words.len() < need {
+        return None;
+    }
+    match vt {
+        ValueType::Uint16 => words.first().map(|&w| w as f64),
+        ValueType::Int16 => words.first().map(|&w| (w as i16) as f64),
+        ValueType::Uint32 => Some(bo.decode_u32([words[0], words[1]]) as f64),
+        ValueType::Int32 => Some(bo.decode_u32([words[0], words[1]]) as i32 as f64),
+        ValueType::Float32 => Some(f32::from_bits(bo.decode_u32([words[0], words[1]])) as f64),
+        ValueType::Uint64 => Some(bo.decode_u64([words[0], words[1], words[2], words[3]]) as f64),
+        ValueType::Int64 => {
+            Some(bo.decode_u64([words[0], words[1], words[2], words[3]]) as i64 as f64)
+        }
+        ValueType::Double => Some(f64::from_bits(
+            bo.decode_u64([words[0], words[1], words[2], words[3]]),
+        )),
+        ValueType::String => None,
+    }
+}
+
+/// Raw byte sequence of `words` under `bo` (2 bytes per register, byte-order aware).
+fn string_bytes(words: &[u16], bo: ByteOrder) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(words.len() * 2);
+    for &w in words {
+        match bo {
+            ByteOrder::Abcd | ByteOrder::Badc => {
+                bytes.push((w >> 8) as u8);
+                bytes.push((w & 0xFF) as u8);
+            }
+            ByteOrder::Cdab | ByteOrder::Dcba => {
+                bytes.push((w & 0xFF) as u8);
+                bytes.push((w >> 8) as u8);
+            }
+        }
+    }
+    bytes
+}
+
+/// True when `bytes` (after trimming trailing NUL pads) form a non-empty
+/// printable **ANSI / ASCII** string. Only 0x20–0x7E plus space / CR / NL are
+/// accepted; multi-byte characters (such as Chinese) are NOT treated as valid
+/// for byte-order auto-matching purposes.
+fn valid_ansi_bytes(bytes: &[u8]) -> bool {
+    let end = bytes.iter().rposition(|&b| b != 0).map_or(0, |i| i + 1);
+    let s = &bytes[..end];
+    if s.is_empty() {
+        return false;
+    }
+    s.iter()
+        .all(|&b| b.is_ascii_graphic() || b == b' ' || b == b'\t' || b == b'\r' || b == b'\n')
+}
+
+/// Pick a byte order satisfying the auto-match rule:
+/// - `String` → the byte sequence is printable ANSI/ASCII (no Chinese / multi-byte);
+/// - numeric types → the decoded value falls within `[0, max]`.
+/// Tries orders in [`ByteOrder::ALL`] order (ABCD first) and returns the first match.
+fn match_byte_order(vt: ValueType, words: &[u16], min: f64, max: f64) -> Option<ByteOrder> {
+    for bo in ByteOrder::ALL {
+        let ok = match vt {
+            ValueType::String => valid_ansi_bytes(&string_bytes(words, bo)),
+            _ => numeric_value(vt, words, bo)
+                .map(|v| (min..=max).contains(&v))
+                .unwrap_or(false),
+        };
+        if ok {
+            return Some(bo);
+        }
+    }
+    None
+}
+
 /// The register table delegate: columns + per-area row rendering.
 pub struct RegTableDelegate {
     area: Area,
@@ -626,6 +710,10 @@ pub struct AppView {
     parser_hex_input: Entity<InputState>,
     /// `String(N)` byte-length input in the parser dialog.
     parser_str_len_input: Entity<InputState>,
+    /// Numeric auto-range down bound for byte-order matching (default 0).
+    parser_range_min_input: Entity<InputState>,
+    /// Numeric auto-range upper bound for byte-order matching (default 10000).
+    parser_range_max_input: Entity<InputState>,
     table: Entity<TableState<RegTableDelegate>>,
     active_area: Area,
     selected_row: Option<usize>,
@@ -731,16 +819,33 @@ impl AppView {
                 .default_value("0001 0000 0005 01 03 02 12 34")
         });
         let parser_str_len_input = cx.new(|cx| InputState::new(window, cx).default_value("7"));
+        let parser_range_min_input = cx.new(|cx| InputState::new(window, cx).default_value("0"));
+        let parser_range_max_input =
+            cx.new(|cx| InputState::new(window, cx).default_value("10000"));
         // Pre-parse the default example right away.
         {
             let hex = parser_hex_input.read(cx).value().to_string();
             match parse_modbus_hex(&hex) {
                 Ok(info) => {
+                    let words = info.words.clone();
+                    // Auto-select a type matching the byte count (2->Int16, 4->Int32, 8->Int64).
+                    let vt = if words.is_empty() {
+                        None
+                    } else {
+                        Some(type_for_byte_count(words.len() * 2))
+                    };
                     parser_state.update(cx, |s, _| {
-                        s.set_data(info.words.clone());
+                        s.set_data(words);
+                        if let Some(vt) = vt {
+                            s.set_type(vt);
+                        }
                         s.info = Some(info);
                         s.error = None;
                     });
+                    if let Some(vt) = vt {
+                        parser_type_select
+                            .update(cx, |sel, cx| sel.set_selected_value(&vt, window, cx));
+                    }
                 }
                 Err(e) => parser_state.update(cx, |s, _| s.error = Some(e)),
             }
@@ -884,6 +989,8 @@ impl AppView {
             parser_byte_order_select,
             parser_hex_input,
             parser_str_len_input,
+            parser_range_min_input,
+            parser_range_max_input,
             table,
             active_area: Area::HoldingRegisters,
             selected_row: None,
@@ -1618,11 +1725,25 @@ impl AppView {
         let hex = self.parser_hex_input.read(cx).value().to_string();
         match parse_modbus_hex(&hex) {
             Ok(info) => {
+                let words = info.words.clone();
+                // Auto-select the type by byte count (2->Int16, 4->Int32, 8->Int64).
+                let vt = if words.is_empty() {
+                    None
+                } else {
+                    Some(type_for_byte_count(words.len() * 2))
+                };
+                let type_sel = self.parser_type_select.clone();
                 self.parser_state.update(cx, |s, _| {
-                    s.set_data(info.words.clone());
+                    s.set_data(words);
+                    if let Some(vt) = vt {
+                        s.set_type(vt);
+                    }
                     s.info = Some(info);
                     s.error = None;
                 });
+                if let Some(vt) = vt {
+                    type_sel.update(cx, |sel, cx| sel.set_selected_value(&vt, window, cx));
+                }
             }
             Err(e) => self.parser_state.update(cx, |s, _| s.error = Some(e)),
         }
@@ -1646,6 +1767,8 @@ impl AppView {
         let parser_byte_order_select = self.parser_byte_order_select.clone();
         let parser_hex_input = self.parser_hex_input.clone();
         let parser_str_len_input = self.parser_str_len_input.clone();
+        let parser_range_min_input = self.parser_range_min_input.clone();
+        let parser_range_max_input = self.parser_range_max_input.clone();
 
         window.open_dialog(cx, move |dialog, _window, _cx| {
             let ps = parser_state.read(_cx);
@@ -1865,6 +1988,124 @@ impl AppView {
                         .child(format!("{} 位", nbits)),
                 );
 
+            // --- auto-match row: type by byte count, byte order by rule ------
+            let auto_row = h_flex()
+                .gap_2()
+                .items_center()
+                .child(
+                    Button::new("parser-auto-type")
+                        .small()
+                        .ghost()
+                        .label("匹配类型")
+                        .tooltip("按返回字节数自动选择：2 字节→Int16，4 字节→Int32，8 字节→Int64")
+                        .on_click({
+                            let ps = parser_state.clone();
+                            let tsel = parser_type_select.clone();
+                            move |_, window, cx| {
+                                let n_words = ps.read(cx).words.len();
+                                if n_words == 0 {
+                                    window.push_notification(
+                                        Notification::warning("没有可匹配的寄存器数据（可能为纯请求帧）"),
+                                        cx,
+                                    );
+                                    return;
+                                }
+                                let vt = type_for_byte_count(n_words * 2);
+                                ps.update(cx, |s, _| s.set_type(vt));
+                                tsel.update(cx, |sel, cx| sel.set_selected_value(&vt, window, cx));
+                                window.refresh();
+                            }
+                        }),
+                )
+                .child(
+                    Button::new("parser-auto-order")
+                        .small()
+                        .ghost()
+                        .label("匹配字节序")
+                        .tooltip("数字：值在 [最小, 最大] 内；String：能解析出有效 ANSI/ASCII 字符")
+                        .on_click({
+                            let ps = parser_state.clone();
+                            let os = parser_byte_order_select.clone();
+                            let rmin=parser_range_min_input.clone();
+                            let rmax = parser_range_max_input.clone();
+                            move |_, window, cx| {
+                                let min = rmax
+                                    .read(cx)
+                                    .value()
+                                    .to_string()
+                                    .trim()
+                                    .parse::<f64>()
+                                    .unwrap_or(0.0);
+                                let max = rmin
+                                    .read(cx)
+                                    .value()
+                                    .to_string()
+                                    .trim()
+                                    .parse::<f64>()
+                                    .unwrap_or(0.0);
+                                let (vt, words) = {
+                                    let s = ps.read(cx);
+                                    (s.value_type, s.words.clone())
+                                };
+                                if words.is_empty() {
+                                    window.push_notification(
+                                        Notification::warning("没有可匹配的寄存器数据（可能为纯请求帧）"),
+                                        cx,
+                                    );
+                                    return;
+                                }
+                                match match_byte_order(vt, &words,min,max) {
+                                    Some(bo) => {
+                                        ps.update(cx, |s, _| s.set_byte_order(bo));
+                                        os.update(cx, |sel, cx| {
+                                            sel.set_selected_value(&bo, window, cx)
+                                        });
+                                        window.push_notification(
+                                            Notification::info(format!("已匹配字节序：{}", bo.name())),
+                                            cx,
+                                        );
+                                    }
+                                    None => {
+                                        window.push_notification(
+                                            Notification::warning("未找到满足条件的字节序（请调整范围或类型）"),
+                                            cx,
+                                        );
+                                    }
+                                }
+                                window.refresh();
+                            }
+                        }),
+                )
+                .when(!is_string, |this| {
+                    this.child(
+                        h_flex()
+                            .gap_1()
+                            .items_center()
+                            .child(
+                                div()
+                                    .text_size(px(12.))
+                                    .text_color(_cx.theme().muted_foreground)
+                                    .child("范围 "),
+                            )
+                            .child(div().w(px(72.)).child(Input::new(&parser_range_min_input).small()))
+                            .child("-".to_string())
+                            .child(div().w(px(72.)).child(Input::new(&parser_range_max_input).small())),
+                    )
+                })
+                .child(div().flex_1())
+                .child(
+                    div()
+                        .text_size(px(12.))
+                        .text_color(_cx.theme().muted_foreground)
+                        .child(if is_string {
+                            "自动匹配字节序：解析有效 ANSI/ASCII 字符".to_string()
+                        } else {
+                            let min = parser_range_min_input.read(_cx).value().to_string();
+                            let max = parser_range_max_input.read(_cx).value().to_string();
+                            format!("数字类型匹配值需在[{min}, {max}] 内")
+                        }),
+                );
+
             dialog
                 .title("Modbus 协议解析 (16 进制)".to_string())
                 .width(px(680.))
@@ -1875,6 +2116,7 @@ impl AppView {
                         .child(hex_row)
                         .child(header)
                         .child(controls)
+                        .child(auto_row)
                         .child(value_line)
                         .child(grid_label)
                         .child(

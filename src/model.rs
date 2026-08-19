@@ -910,4 +910,73 @@ mod tests {
             assert_eq!(ValueType::String.decode_words(&words, bo), "AB");
         }
     }
+
+    #[test]
+    fn byte_order_u64_round_trip_all_orders() {
+        let v: u64 = 0x0123_4567_89AB_CDEF;
+        for bo in ByteOrder::ALL {
+            let words = bo.encode_u64(v);
+            assert_eq!(bo.decode_u64(words), v, "round-trip failed for {:?}", bo);
+        }
+    }
+
+    #[test]
+    fn byte_order_u64_exact_wire_pattern() {
+        // ABCD: high u32 in registers 0..2, low u32 in 2..4.
+        let v: u64 = 0x1234_5678_9ABC_DEF0;
+        assert_eq!(
+            ByteOrder::Abcd.encode_u64(v),
+            [0x1234, 0x5678, 0x9ABC, 0xDEF0]
+        );
+        // CDAB: each 32-bit half word-swapped; high half first.
+        assert_eq!(
+            ByteOrder::Cdab.encode_u64(v),
+            [0x5678, 0x1234, 0xDEF0, 0x9ABC]
+        );
+    }
+
+    #[test]
+    fn value_type_64bit_round_trip() {
+        for bo in ByteOrder::ALL {
+            // UInt64
+            let words = ValueType::Uint64
+                .encode_text("123456789012345", bo, 4)
+                .unwrap();
+            assert_eq!(
+                ValueType::Uint64.decode_words(&words, bo),
+                "123456789012345",
+                "{:?}",
+                bo
+            );
+            // Int64 (negative)
+            let words = ValueType::Int64
+                .encode_text("-98765432109876543", bo, 4)
+                .unwrap();
+            assert_eq!(
+                ValueType::Int64.decode_words(&words, bo),
+                "-98765432109876543",
+                "{:?}",
+                bo
+            );
+            // Double
+            let words = ValueType::Double
+                .encode_text("3.14159", bo, 4)
+                .unwrap();
+            let decoded = ValueType::Double
+                .decode_words(&words, bo)
+                .parse::<f64>()
+                .unwrap();
+            assert!((decoded - 3.14159).abs() < 1e-5, "{:?}", bo);
+        }
+    }
+
+    #[test]
+    fn value_type_64bit_register_width() {
+        assert_eq!(ValueType::Uint64.fixed_registers(), Some(4));
+        assert_eq!(ValueType::Int64.fixed_registers(), Some(4));
+        assert_eq!(ValueType::Double.fixed_registers(), Some(4));
+        assert_eq!(ValueType::Uint64.bits(), Some(64));
+        assert_eq!(ValueType::Int64.bits(), Some(64));
+        assert_eq!(ValueType::Double.bits(), Some(64));
+    }
 }
