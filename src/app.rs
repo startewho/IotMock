@@ -97,8 +97,7 @@ fn parse_hex_words(text: &str) -> Result<Vec<u16>, String> {
             .strip_prefix("0x")
             .or_else(|| t.strip_prefix("0X"))
             .unwrap_or(t);
-        let v = u16::from_str_radix(cleaned, 16)
-            .map_err(|_| format!("无效的十六进制 '{t}'"))?;
+        let v = u16::from_str_radix(cleaned, 16).map_err(|_| format!("无效的十六进制 '{t}'"))?;
         words.push(v);
     }
     Ok(words)
@@ -125,7 +124,7 @@ impl RegTableDelegate {
             columns: vec![
                 Column::new("addr", "地址").width(80.).resizable(false),
                 Column::new("name", "名称").width(150.).resizable(false),
-                Column::new("bits", "位 (Bit)").width(240.).resizable(false),
+                Column::new("bits", "位 (Bit)").width(240.).resizable(true),
                 Column::new("value", "值").width(140.).resizable(false),
                 Column::new("writer", "最后写入")
                     .width(130.)
@@ -245,7 +244,11 @@ impl TableDelegate for RegTableDelegate {
                     v_flex()
                         .px_2()
                         .gap_0()
-                        .child(h_flex().gap_1().children((0..8).map(|i| mk_bit(i, v >> i & 1 == 1))))
+                        .child(
+                            h_flex()
+                                .gap_1()
+                                .children((0..8).map(|i| mk_bit(i, v >> i & 1 == 1))),
+                        )
                         .child(
                             h_flex()
                                 .gap_1()
@@ -572,8 +575,7 @@ impl AppView {
             cx.new(|cx| InputState::new(window, cx).placeholder("输入字符串 / 字符，回车或点应用"));
         let hex_input =
             cx.new(|cx| InputState::new(window, cx).placeholder("十六进制寄存器，如 1234 5678"));
-        let str_len_input =
-            cx.new(|cx| InputState::new(window, cx).default_value("7"));
+        let str_len_input = cx.new(|cx| InputState::new(window, cx).default_value("7"));
 
         let auto_sim = Arc::new(AtomicBool::new(true));
 
@@ -1296,8 +1298,7 @@ impl AppView {
                                                 num_input
                                                     .update(cx, |s, cx| s.set_value(text, w, cx));
                                             }
-                                            hex_input
-                                                .update(cx, |s, cx| s.set_value(hex, w, cx));
+                                            hex_input.update(cx, |s, cx| s.set_value(hex, w, cx));
                                         }),
                                 )
                                 .text_color(_cx.theme().muted_foreground)
