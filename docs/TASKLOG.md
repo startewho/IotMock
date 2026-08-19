@@ -109,6 +109,29 @@
 - `apply_hex` 校验输入字数与当前寄存器数一致，避免写入不同宽度。
 - `sync_string_len_from_input` 与 `sync_dialog_inputs` 互相 set_value 会触发 Change 事件 → 用 `set_input_if_changed` 守卫防无限递归。
 
+### ✅ 已完成：阶段五 — 表格内 Bit 位直接勾选编辑
+
+用户新增需求（本次会话）：
+
+> 表格页直接添加一列，使用 Bit 位显示，直接可以勾选编辑，最多 8 个 bit 位一行，和编辑数据的位显示一样。
+
+| # | 任务 | 说明 | 状态 |
+|---|------|------|------|
+| 1 | 表列调整 | `RegTableDelegate` 新增 `store: SharedStore` 字段与「位 (Bit)」列（位于「名称」之后），各列宽度重排 | ✅ |
+| 2 | 位列渲染 | `render_td` 新增 `"bits"` 分支：寄存器区每行 16 位、**最多 8 位一行**（2 行 × 8）；位区每行 1 个复选框 | ✅ |
+| 3 | 实时读值 | 位列直接从共享 store 读实时值（不走快照），勾选后 `window.refresh()` 立即翻转 | ✅ |
+| 4 | 直接勾选写回 | `on_click` 计算新值 `set(area,addr,"UI")` 写回 store，修改行写入者标记为 UI | ✅ |
+| 5 | 只读区域禁用 | 线圈/保持寄存器可勾选；离散输入/输入寄存器 `.disabled(true)` | ✅ |
+| 6 | 唯一 id | 复选框 id 用 `SharedString::from(format!("tblbit-{addr}-{bit_ix}"))` 保证每格唯一 | ✅ |
+| 7 | 构建/测试/验证 | `cargo build` 无警告；26 测试全绿 | ✅ |
+| 8 | 文档 | `README.md` 补充表格内位编辑说明 | ✅ |
+
+**踩坑记录：**
+- `Checkbox::new` 的 `ElementId` 不支持 3 元组 `(&str,usize,usize)`，也不支持 `(ElementId, usize)`（`usize: Into<SharedString>` 不成立）→ 改用 `SharedString::from(format!())` 作为唯一 id。
+- `Checkbox::disabled()` 来自 `Disableable` trait，需显式 `use gpui_component::Disableable`。
+- 表 `render_td` 的 `match` 各分支需同类型（`Div`）→ 位列的 `if/else` 两分支都不要 `into_any_element()`（内层 `mk_bit` helper 返回 `AnyElement` 作为子元素即可）。
+- `render_td` 需带实时值读取，需给 delegate 注入 `SharedStore`（在 `AppView::new` 创建表时 `RegTableDelegate::new(store.clone())`）。
+
 ### ⏳ 计划中：后续阶段（可选）
 
 - [ ] 扩展 S7 协议（实现 `Protocol` trait 并注册）
@@ -159,3 +182,5 @@ BADC `[0x3412, 0x7856]`；DCBA `[0x7856, 0x3412]`。
 | 阶段四完成 | `cargo build` | 无警告 |
 | 阶段四完成 | `cargo test` | 26 通过 / 0 失败（25 单测 + 1 集成） |
 | 阶段四完成 | `cargo test --lib model::tests` | 18 通过 / 0 失败 |
+| 阶段五完成 | `cargo build` | 无警告 |
+| 阶段五完成 | `cargo test` | 26 通过 / 0 失败（25 单测 + 1 集成） |

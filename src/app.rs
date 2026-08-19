@@ -23,8 +23,8 @@ use gpui_component::{
     switch::Switch,
     tab::{Tab, TabBar},
     table::{Column, Table, TableDelegate, TableEvent, TableState},
-    v_flex, ActiveTheme as _, Icon, IconName, IndexPath, Root, Sizable as _, Theme, ThemeMode,
-    WindowExt as _,
+    v_flex, ActiveTheme as _, Disableable, Icon, IconName, IndexPath, Root, Sizable as _, Theme,
+    ThemeMode, WindowExt as _,
 };
 
 use iot_mock::model::{
@@ -110,20 +110,25 @@ pub struct RegTableDelegate {
     rows: Vec<Row>,
     prev: Vec<u16>,
     columns: Vec<Column>,
+    /// Shared register store, used by the in-table bit checkboxes to read the
+    /// live value and write immediately on toggle.
+    store: SharedStore,
 }
 
 impl RegTableDelegate {
-    fn new() -> Self {
+    fn new(store: SharedStore) -> Self {
         Self {
             area: Area::HoldingRegisters,
             rows: Vec::new(),
             prev: Vec::new(),
+            store,
             columns: vec![
-                Column::new("addr", "地址").width(90.).resizable(false),
-                Column::new("name", "名称").width(170.).resizable(false),
-                Column::new("value", "值").width(170.).resizable(false),
+                Column::new("addr", "地址").width(80.).resizable(false),
+                Column::new("name", "名称").width(150.).resizable(false),
+                Column::new("bits", "位 (Bit)").width(240.).resizable(false),
+                Column::new("value", "值").width(140.).resizable(false),
                 Column::new("writer", "最后写入")
-                    .width(140.)
+                    .width(130.)
                     .resizable(false),
             ],
         }
@@ -196,6 +201,58 @@ impl TableDelegate for RegTableDelegate {
                 .text_color(theme.muted_foreground)
                 .child(format!("{0}", row.addr)),
             "name" => div().px_2().child(row.name.clone()),
+            "bits" => {
+                // Read the live value so an in-place toggle reflects instantly.
+                let v = self
+                    .store
+                    .read()
+                    .unwrap()
+                    .get(self.area, row.addr)
+                    .unwrap_or(0);
+                let writable = self.area.writable();
+                let store = self.store.clone();
+                let area = self.area;
+                let addr = row.addr;
+                let mk_bit = move |bit_ix: usize, on: bool| -> gpui::AnyElement {
+                    let store = store.clone();
+                    Checkbox::new(gpui::SharedString::from(format!("tblbit-{addr}-{bit_ix}")))
+                        .small()
+                        .checked(on)
+                        .disabled(!writable)
+                        .on_click(move |&checked, window, _cx| {
+                            let mut s = store.write().unwrap();
+                            let cur = s.get(area, addr).unwrap_or(0);
+                            let newv = if checked {
+                                cur | (1 << bit_ix)
+                            } else {
+                                cur & !(1 << bit_ix)
+                            };
+                            s.set(area, addr, newv, "UI");
+                            drop(s);
+                            // Force an immediate redraw so the checkbox flick
+                            // (the live-value read above picks it up).
+                            window.refresh();
+                        })
+                        .into_any_element()
+                };
+                if bit {
+                    h_flex()
+                        .px_2()
+                        .gap_1()
+                        .items_center()
+                        .child(mk_bit(0, v & 1 == 1))
+                } else {
+                    v_flex()
+                        .px_2()
+                        .gap_0()
+                        .child(h_flex().gap_1().children((0..8).map(|i| mk_bit(i, v >> i & 1 == 1))))
+                        .child(
+                            h_flex()
+                                .gap_1()
+                                .children((8..16).map(|i| mk_bit(i, v >> i & 1 == 1))),
+                        )
+                }
+            }
             "value" => {
                 let color = if bit {
                     if row.value != 0 {
@@ -485,7 +542,7 @@ impl AppView {
 
         // -- register table ---------------------------------------------------
         let table = cx.new(|cx| {
-            TableState::new(RegTableDelegate::new(), window, cx)
+            TableState::new(RegTableDelegate::new(store.clone()), window, cx)
                 .sortable(false)
                 .col_movable(false)
                 .col_resizable(true)
