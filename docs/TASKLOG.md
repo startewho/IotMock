@@ -78,6 +78,37 @@
 - clippy `approx_constant`：float 测试用 `3.14` 会被当成 π 近似值拒绝 → 改用 `2.5`。
 - 对话框「OK」直接走 `apply_typed`（写回 + 同步 bits + 刷新表格），保证与「应用」一致。
 
+### ✅ 已完成：阶段四 — 16 进制编辑切换 + String(N) + 标题栏拖动
+
+用户新增需求（本次会话）：
+
+> 1. 编辑数据界面：除了现在能按 Bit 位展示，也可以**切换 16 进制的展示编辑**。
+> 2. 对 String，需要支持 **String(7) 这样的可设定字符个数**；同时 Bit 位和 16 进制也要**根据计算出来的 Byte 长度展示**。
+> 3. 支持**现在自定义的标题栏拖动**。
+
+| # | 任务 | 说明 | 状态 |
+|---|------|------|------|
+| 1 | 模型：字节↔寄存器换算 | `model.rs` 新增 `bytes_to_regs`（2 字节/寄存器，向上取整）、`encode_string_fixed`（按 N 字节定宽填充、超长报错） | ✅ |
+| 2 | String 模型单元测试 | `bytes_to_regs` 取整、定宽填充、超长拒绝（字符与寄存器上限）、4 字节序往返 | ✅ 全绿 |
+| 3 | 编辑器重构 | `BitEditorState` 移除固定 `width`，改 `Vec<bool> bits + reg_count`（任意寄存器宽度）；新增 `ViewMode`（Bits/Hex）、`string_chars`；`set_words/words/hex_text/byte_len/apply_words` | ✅ |
+| 4 | String(N) 长度输入 | 类型选 String 时显示「字符数/字节数 (String(N))」输入；`str_len_input` 订阅 `InputEvent::Change` → 重算寄存器数并重载；防重入用 `set_input_if_changed` 守卫 | ✅ |
+| 5 | 显示方式切换 | 弹窗加「位编辑 / 16进制」按钮（`.when` 切换 primary/ghost 高亮），`_window.refresh()` 触发重绘 | ✅ |
+| 6 | 16 进制编辑 | Hex 模式显示空格分隔的 16 位寄存器字输入；`parse_hex_words` 解析（容错 `0x`、校验字数）；「应用16进制」按原始字写入 | ✅ |
+| 7 | 位/Hex/类型联动 | 位勾选同步 typed 与 hex 预览；Hex 应用同步 typed；类型切换重载；OK 按当前模式提交（Hex=apply_hex，Bits=apply_words） | ✅ |
+| 8 | 字节/寄存器展示 | 位视图显示全部占用位、模式行与底部标注「占用 X 寄存器 · Y 字节」（如 String(7)=4 寄存器 · 7 字节） | ✅ |
+| 9 | 标题栏拖动 | `title_bar_drag` 用 `window_control_area(WindowControlArea::Drag)`（原生 HTCAPTION），标题+空白区可拖，主题/关闭按钮在拖拽区外仍可点击 | ✅ |
+| 10 | 构建/测试/验证 | `cargo build` 无警告；26 测试全绿（25 单测 + 1 集成） | ✅ |
+| 11 | 文档 | `README.md` 更新编辑/字符串/标题栏功能说明 | ✅ |
+
+**踩坑记录：**
+- `Entity::update` 的闭包会捕获入参引用 → 传 `text: &str` 触发 E0521，需先 `to_string()` 转拥有型。
+- `Vec<bool>` 的 `resize` 内 `b[..n].copy_from_slice(&self.bits[..n])` 触发 E0502 双重借用 → 先算局部 `n`。
+- 对话框渲染闭包里 `cx` 是 `&mut App`，`cx.notify()` 需 `EntityId` → 改用 `_window.refresh()` 触发重绘。
+- `on_ok` 闭包需 `'static`，不能捕获借用的 `bits` 守卫 → 只捕获 Copy 的 `view_mode` 与 `Rc` 共享的 apply 闭包。
+- 多个按钮/OK 复用同一定制闭包 → 用 `Rc::new(closure)` + clone（定制闭包不可 Clone）。
+- `apply_hex` 校验输入字数与当前寄存器数一致，避免写入不同宽度。
+- `sync_string_len_from_input` 与 `sync_dialog_inputs` 互相 set_value 会触发 Change 事件 → 用 `set_input_if_changed` 守卫防无限递归。
+
 ### ⏳ 计划中：后续阶段（可选）
 
 - [ ] 扩展 S7 协议（实现 `Protocol` trait 并注册）
@@ -125,3 +156,6 @@ BADC `[0x3412, 0x7856]`；DCBA `[0x7856, 0x3412]`。
 | 阶段三完成 | `cargo test` | 22 通过 / 0 失败（21 单测 + 1 集成） |
 | 阶段三完成 | `cargo clippy --all-targets` | 无警告 |
 | 阶段三完成 | GUI 启动 `iot-mock.exe` | 进程存活且 `Responding=True` |
+| 阶段四完成 | `cargo build` | 无警告 |
+| 阶段四完成 | `cargo test` | 26 通过 / 0 失败（25 单测 + 1 集成） |
+| 阶段四完成 | `cargo test --lib model::tests` | 18 通过 / 0 失败 |

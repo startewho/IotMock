@@ -1,5 +1,6 @@
 //! Main application view: title bar, protocol sidebar, register table, dialogs.
 
+use std::rc::Rc;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     Arc,
@@ -8,14 +9,14 @@ use std::time::Duration;
 
 use gpui::{
     div, prelude::FluentBuilder as _, px, App, AppContext as _, AsyncApp, Context, Entity,
-    IntoElement, ParentElement as _, Render, Styled as _, Subscription, Task, Window,
+    InteractiveElement, IntoElement, ParentElement as _, Render, Styled as _, Subscription, Task,
+    Window, WindowControlArea,
 };
 use gpui_component::{
     button::{Button, ButtonVariants as _},
     checkbox::Checkbox,
     h_flex,
     input::{Input, InputState},
-    label,
     notification::Notification,
     scroll::ScrollableElement as _,
     select::{Select, SelectItem, SelectState},
@@ -27,8 +28,8 @@ use gpui_component::{
 };
 
 use iot_mock::model::{
-    shared_store, snapshot_area, Area, AreaSnapshot, ByteOrder, DataWidth, RegisterStore, Row,
-    SharedStore, ValueType, ALL_AREAS, DEFAULT_AREA_SIZE,
+    bytes_to_regs, encode_string_fixed, shared_store, snapshot_area, Area, AreaSnapshot, ByteOrder,
+    RegisterStore, Row, SharedStore, ValueType, ALL_AREAS, DEFAULT_AREA_SIZE,
 };
 use iot_mock::protocol::{
     modbus::{ModbusTcpServer, DEFAULT_PORT},
@@ -81,6 +82,26 @@ impl From<ValueType> for ValueTypeItem {
     fn from(v: ValueType) -> Self {
         Self(v)
     }
+}
+
+/// Parse a space-separated list of 16-bit hex values such as `"1234 5678"`
+/// (optional `0x` prefixes are accepted) into register words.
+fn parse_hex_words(text: &str) -> Result<Vec<u16>, String> {
+    let tokens: Vec<&str> = text.split_whitespace().filter(|t| !t.is_empty()).collect();
+    if tokens.is_empty() {
+        return Err("请输入十六进制寄存器值".to_string());
+    }
+    let mut words = Vec::with_capacity(tokens.len());
+    for t in tokens {
+        let cleaned = t
+            .strip_prefix("0x")
+            .or_else(|| t.strip_prefix("0X"))
+            .unwrap_or(t);
+        let v = u16::from_str_radix(cleaned, 16)
+            .map_err(|_| format!("无效的十六进制 '{t}'"))?;
+        words.push(v);
+    }
+    Ok(words)
 }
 
 /// The register table delegate: columns + per-area row rendering.
@@ -222,102 +243,116 @@ impl TableDelegate for RegTableDelegate {
     }
 }
 
-/// Editor state for the register bit/typed edit dialog.
+/// How the edit dialog presents the raw register value.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum ViewMode {
+    /// Toggle individual bits with checkboxes.
+    #[default]
+    Bits,
+    /// Edit the raw register words as 16-bit hexadecimal values.
+    Hex,
+}
+
+/// Editor state for the register bit/typed/hex edit dialog.
 ///
 /// Kept as its own mutable entity because the dialog's render function is
 /// re-invoked every frame; the checkboxes and inputs read/write this entity so
-/// their state survives re-renders. `bits[0]` is the LSB.
+/// their state survives re-renders. `bits` holds every bit of the value (LSB
+/// of register 0 first); its length is `reg_count * 16`.
 pub struct BitEditorState {
-    /// 32 bools; only `width.bits()` of them are meaningful.
-    bits: [bool; 32],
-    width: DataWidth,
+    /// Raw bits of the value (`reg_count * 16` entries).
+    bits: Vec<bool>,
+    /// Number of 16-bit registers spanned by the current value.
+    reg_count: usize,
     addr: usize,
     area: Area,
     byte_order: ByteOrder,
     /// The type used to interpret and "auto-fill" the registers.
     value_type: ValueType,
+    /// `String(N)` byte capacity (only meaningful when `value_type == String`).
+    string_chars: usize,
     /// Last accepted string for `ValueType::String` (may be many registers).
     pending_string: String,
+    view_mode: ViewMode,
 }
 
 impl BitEditorState {
     fn new() -> Self {
         Self {
-            bits: [false; 32],
-            width: DataWidth::Bits16,
+            bits: vec![false; 16],
+            reg_count: 1,
             addr: 0,
             area: Area::HoldingRegisters,
             byte_order: ByteOrder::Abcd,
             value_type: ValueType::Uint16,
+            string_chars: 7,
             pending_string: String::new(),
+            view_mode: ViewMode::Bits,
         }
     }
 
-    /// Load the current value at `addr` into the bit array for the given width.
-    /// 32-bit values span `addr` and `addr + 1`, decoded by `byte_order`.
-    fn load(
-        &mut self,
-        store: &RegisterStore,
-        area: Area,
-        addr: usize,
-        width: DataWidth,
-        byte_order: ByteOrder,
-    ) -> bool {
-        let value32 = match width {
-            DataWidth::Bits16 => store.get(area, addr).unwrap_or(0) as u32,
-            DataWidth::Bits32 => {
-                let w0 = store.get(area, addr).unwrap_or(0);
-                let w1 = store.get(area, addr + 1).unwrap_or(0);
-                byte_order.decode_u32([w0, w1])
-            }
-        };
-        self.area = area;
-        self.addr = addr;
-        self.width = width;
-        self.byte_order = byte_order;
-        self.bits = [false; 32];
-        for i in 0..width.bits() {
-            self.bits[i] = (value32 >> i) & 1 == 1;
+    /// Register count spanned by the current value: a fixed width for numeric
+    /// types, or `bytes_to_regs(string_chars)` for strings.
+    fn regs_for_type(&self) -> usize {
+        match self.value_type {
+            ValueType::String => bytes_to_regs(self.string_chars),
+            t => t.fixed_registers().unwrap_or(1),
         }
+    }
+
+    /// Byte length of the current value: `string_chars` for strings, otherwise
+    /// derived from the register count.
+    pub fn byte_len(&self) -> usize {
+        match self.value_type {
+            ValueType::String => self.string_chars,
+            _ => self.reg_count * 2,
+        }
+    }
+
+    /// Load the current value at `addr` into the raw bit view, reading
+    /// `reg_count` registers (`bytes_to_regs(string_chars)` for strings).
+    fn load(&mut self, store: &RegisterStore, byte_order: ByteOrder) -> bool {
+        let reg_count = self.regs_for_type();
+        let words = store
+            .range(self.area, self.addr, reg_count)
+            .unwrap_or_else(|| vec![0; reg_count]);
+        self.byte_order = byte_order;
+        self.reg_count = words.len();
+        self.set_words(&words);
         true
     }
 
-    /// Overwrite the raw bit view from register words (16-bit -> 16 bits,
-    /// 32-bit -> 32 bits via byte order).
+    /// Overwrite the raw bit view from register words: register `k` occupies
+    /// bits `[k*16, (k+1)*16)`, bit 0 of each register being its LSB.
     fn set_words(&mut self, words: &[u16]) {
-        let word0 = words.first().copied().unwrap_or(0);
-        let value32 = match self.width {
-            DataWidth::Bits16 => word0 as u32,
-            DataWidth::Bits32 => {
-                let w1 = words.get(1).copied().unwrap_or(0);
-                self.byte_order.decode_u32([word0, w1])
+        self.reg_count = words.len();
+        self.bits = vec![false; words.len() * 16];
+        for (k, &w) in words.iter().enumerate() {
+            for i in 0..16 {
+                self.bits[k * 16 + i] = (w >> i) & 1 == 1;
             }
-        };
-        self.bits = [false; 32];
-        for i in 0..self.width.bits() {
-            self.bits[i] = (value32 >> i) & 1 == 1;
         }
+    }
+
+    /// Assemble the raw register words from the current bits.
+    fn words(&self) -> Vec<u16> {
+        (0..self.reg_count)
+            .map(|k| {
+                let mut w = 0u16;
+                for i in 0..16 {
+                    if self.bits.get(k * 16 + i).copied().unwrap_or(false) {
+                        w |= 1 << i;
+                    }
+                }
+                w
+            })
+            .collect()
     }
 
     fn set_bit(&mut self, ix: usize, on: bool) {
-        if ix < self.width.bits() {
-            self.bits[ix] = on;
+        if let Some(b) = self.bits.get_mut(ix) {
+            *b = on;
         }
-    }
-
-    /// Assemble the bits into a 32-bit value (bit 0 = LSB).
-    fn value_u32(&self) -> u32 {
-        let mut v = 0u32;
-        for i in 0..self.width.bits() {
-            if self.bits[i] {
-                v |= 1 << i;
-            }
-        }
-        v
-    }
-
-    fn value_u16(&self) -> u16 {
-        self.value_u32() as u16
     }
 
     /// Apply a typed value (number or string) from `text` into the store at
@@ -328,18 +363,29 @@ impl BitEditorState {
             return Err("区域只读".to_string());
         }
         let budget = store.len(self.area).saturating_sub(self.addr);
-        let words = self.value_type.encode_text(text, self.byte_order, budget)?;
+        let words = if self.value_type == ValueType::String {
+            encode_string_fixed(text, self.byte_order, budget, self.string_chars)?
+        } else {
+            self.value_type.encode_text(text, self.byte_order, budget)?
+        };
         if self.value_type == ValueType::String {
             self.pending_string = text.to_string();
-            let n = words.len().min(2);
-            self.set_words(&words[..n]);
-            // For strings wider than 2 registers, widen the raw view so bit
-            // editing (if any) still covers the first two registers.
-            if words.len() > 2 {
-                self.width = DataWidth::Bits32;
-            }
-        } else {
-            self.set_words(&words);
+        }
+        self.set_words(&words);
+        if !store.set_range(self.area, self.addr, &words, "UI") {
+            return Err("地址超出范围".to_string());
+        }
+        Ok(words)
+    }
+
+    /// Write the current raw words (from bit or hex editing) to the store.
+    fn apply_words(&mut self, store: &mut RegisterStore) -> Result<Vec<u16>, String> {
+        if !self.area.writable() {
+            return Err("区域只读".to_string());
+        }
+        let words = self.words();
+        if words.is_empty() {
+            return Err("没有可写入的数据".to_string());
         }
         if !store.set_range(self.area, self.addr, &words, "UI") {
             return Err("地址超出范围".to_string());
@@ -351,26 +397,31 @@ impl BitEditorState {
     /// header/preview).
     fn display_value(&self, store: &RegisterStore) -> String {
         let words = store
-            .range(self.area, self.addr, self.width.registers())
+            .range(self.area, self.addr, self.reg_count)
             .unwrap_or_default();
         self.value_type.decode_words(&words, self.byte_order)
     }
 
-    /// Render the current in-memory bit pattern as a typed string (kept in sync
+    /// Render the current in-memory raw words as a typed string (kept in sync
     /// with the typed input each time a checkbox is toggled).
     fn bits_text(&self) -> String {
-        let words = match self.width {
-            DataWidth::Bits16 => vec![self.value_u16()],
-            DataWidth::Bits32 => self.byte_order.encode_u32(self.value_u32()).to_vec(),
-        };
+        let words = self.words();
         self.value_type.decode_words(&words, self.byte_order)
+    }
+
+    /// Render the current raw words as space-separated 16-bit hex, e.g.
+    /// `"1234 5678"`.
+    fn hex_text(&self) -> String {
+        self.words()
+            .iter()
+            .map(|w| format!("{w:04X}"))
+            .collect::<Vec<_>>()
+            .join(" ")
     }
 
     /// Number of registers to read/write for the current type/dialog view.
     fn registers(&self) -> usize {
-        self.value_type
-            .fixed_registers()
-            .unwrap_or(self.width.registers())
+        self.reg_count
     }
 }
 
@@ -389,6 +440,10 @@ pub struct AppView {
     /// Numeric / text inputs reused by the edit dialog.
     num_input: Entity<InputState>,
     str_input: Entity<InputState>,
+    /// Hexadecimal raw-word editor (space-separated `XXXX`) in the dialog.
+    hex_input: Entity<InputState>,
+    /// `String(N)` byte-length input in the dialog.
+    str_len_input: Entity<InputState>,
     table: Entity<TableState<RegTableDelegate>>,
     active_area: Area,
     selected_row: Option<usize>,
@@ -458,6 +513,10 @@ impl AppView {
             cx.new(|cx| InputState::new(window, cx).placeholder("输入数值，回车或点应用"));
         let str_input =
             cx.new(|cx| InputState::new(window, cx).placeholder("输入字符串 / 字符，回车或点应用"));
+        let hex_input =
+            cx.new(|cx| InputState::new(window, cx).placeholder("十六进制寄存器，如 1234 5678"));
+        let str_len_input =
+            cx.new(|cx| InputState::new(window, cx).default_value("7"));
 
         let auto_sim = Arc::new(AtomicBool::new(true));
 
@@ -487,6 +546,20 @@ impl AppView {
             |this, _sel, event, window, cx| {
                 if let gpui_component::select::SelectEvent::Confirm(Some(vt)) = event {
                     this.on_value_type_changed(*vt, window, cx);
+                }
+            },
+        ));
+
+        // When the `String(N)` length changes, resize the raw view and reload.
+        subscriptions.push(cx.subscribe_in(
+            &str_len_input,
+            window,
+            |this, _sel, event, window, cx| {
+                if let gpui_component::input::InputEvent::Change = event {
+                    this.sync_string_len_from_input(window, cx);
+                    let vt = this.bit_editor.read(cx).value_type;
+                    this.sync_dialog_inputs(vt, window, cx);
+                    cx.notify();
                 }
             },
         ));
@@ -527,6 +600,8 @@ impl AppView {
             type_select,
             num_input,
             str_input,
+            hex_input,
+            str_len_input,
             table,
             active_area: Area::HoldingRegisters,
             selected_row: None,
@@ -662,7 +737,7 @@ impl AppView {
     }
 
     /// React to a value-type change in the edit dialog: update the editor's
-    /// type/width, reload the bits, and re-fill the typed input preview.
+    /// type/width, reload the bits, and re-fill the typed/hex input previews.
     fn on_value_type_changed(
         &mut self,
         vt: ValueType,
@@ -674,43 +749,79 @@ impl AppView {
             let e = self.bit_editor.read(cx);
             (e.area, e.addr)
         };
-        let width = match vt.fixed_registers() {
-            Some(1) => DataWidth::Bits16,
-            Some(_) => DataWidth::Bits32,
-            None => DataWidth::Bits16, // string starts as short view
-        };
+        self.sync_string_len_from_input(window, cx);
         {
             let s = self.store.read().unwrap();
             self.bit_editor.update(cx, |e, _| {
-                e.load(&s, area, addr, width, byte_order);
+                e.area = area;
+                e.addr = addr;
                 e.value_type = vt;
+                e.load(&s, byte_order);
             });
         }
-        // Re-fill the typed input with the decoded value.
-        let text = self
-            .bit_editor
-            .read(cx)
-            .display_value(&self.store.read().unwrap());
-        self.fill_typed_input(vt, &text, window, cx);
+        self.sync_dialog_inputs(vt, window, cx);
         cx.notify();
     }
 
-    /// Fill the numeric or string input with `text` depending on the type.
-    fn fill_typed_input(
-        &mut self,
-        vt: ValueType,
+    /// Read the `String(N)` length input and push it into the editor, resizing
+    /// the raw view accordingly.
+    fn set_input_if_changed(
+        &self,
+        input: &Entity<InputState>,
         text: &str,
         window: &mut Window,
         cx: &mut Context<Self>,
     ) {
-        let text = text.to_string();
-        if vt == ValueType::String {
-            self.str_input
-                .update(cx, |s, cx| s.set_value(text, window, cx));
-        } else {
-            self.num_input
-                .update(cx, |s, cx| s.set_value(text, window, cx));
+        if input.read(cx).value().to_string() != text {
+            let text = text.to_string();
+            input.update(cx, |s, cx| s.set_value(text, window, cx));
         }
+    }
+
+    /// Read the `String(N)` length input and push it into the editor, resizing
+    /// the raw bit view to the new register count and reloading from the store.
+    fn sync_string_len_from_input(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let len_text = self.str_len_input.read(cx).value().to_string();
+        let chars = len_text.trim().parse::<usize>().unwrap_or(7).clamp(1, 120);
+        let is_string = self.bit_editor.read(cx).value_type == ValueType::String;
+        let changed = self.bit_editor.update(cx, |e, _| {
+            if is_string && e.string_chars != chars {
+                e.string_chars = chars;
+                true
+            } else {
+                false
+            }
+        });
+        if is_string && (changed || chars != self.bit_editor.read(cx).string_chars) {
+            let s = self.store.read().unwrap();
+            let byte_order = self.bit_editor.read(cx).byte_order;
+            self.bit_editor.update(cx, |e, _| e.load(&s, byte_order));
+            // Keep the length input showing a normalised value.
+            let len = self.bit_editor.read(cx).string_chars.to_string();
+            {
+                let inp = self.str_len_input.clone();
+                self.set_input_if_changed(&inp, &len, window, cx);
+            }
+        }
+    }
+
+    /// Re-fill the numeric, string, hex and length inputs from the editor's
+    /// current words.
+    fn sync_dialog_inputs(&mut self, vt: ValueType, window: &mut Window, cx: &mut Context<Self>) {
+        let (text, hex) = {
+            let s = self.store.read().unwrap();
+            let e = self.bit_editor.read(cx);
+            (e.display_value(&s), e.hex_text())
+        };
+        if vt == ValueType::String {
+            let inp = self.str_input.clone();
+            self.set_input_if_changed(&inp, &text, window, cx);
+        } else {
+            let inp = self.num_input.clone();
+            self.set_input_if_changed(&inp, &text, window, cx);
+        }
+        let hex_inp = self.hex_input.clone();
+        self.set_input_if_changed(&hex_inp, &hex, window, cx);
     }
 
     fn toggle_theme(&mut self, window: &mut Window, cx: &mut Context<Self>) {
@@ -774,7 +885,8 @@ impl AppView {
         let byte_order = self.active_byte_order(cx);
         let row_addr = row_ix;
 
-        // Load a default view derived from the selected type and pre-fill inputs.
+        // Load a default view derived from the selected type and pre-fill the
+        // typed / hex / length inputs.
         {
             let vt = self
                 .type_select
@@ -782,19 +894,19 @@ impl AppView {
                 .selected_value()
                 .copied()
                 .unwrap_or_default();
-            let width = match vt.fixed_registers() {
-                Some(1) | None => DataWidth::Bits16,
-                Some(_) => DataWidth::Bits32,
-            };
-            let text = {
-                let s = self.store.read().unwrap();
-                self.bit_editor.update(cx, |e, _| {
-                    e.load(&s, area, row_addr, width, byte_order);
-                    e.value_type = vt;
-                });
-                self.bit_editor.read(cx).display_value(&s)
-            }; // `s` dropped here
-            self.fill_typed_input(vt, &text, window, cx);
+            self.bit_editor.update(cx, |e, _| {
+                e.area = area;
+                e.addr = row_addr;
+                e.value_type = vt;
+                e.load(&self.store.read().unwrap(), byte_order);
+            });
+            // Echo the current `String(N)` length into its input.
+            if vt == ValueType::String {
+                let len = self.bit_editor.read(cx).string_chars.to_string();
+                let inp = self.str_len_input.clone();
+                self.set_input_if_changed(&inp, &len, window, cx);
+            }
+            self.sync_dialog_inputs(vt, window, cx);
         }
 
         let store = self.store.clone();
@@ -803,28 +915,27 @@ impl AppView {
         let type_select = self.type_select.clone();
         let num_input = self.num_input.clone();
         let str_input = self.str_input.clone();
+        let hex_input = self.hex_input.clone();
+        let str_len_input = self.str_len_input.clone();
         let area_zh = area.name_zh();
         let order_code = byte_order.code().to_string();
 
-        // Shared "apply typed value → fill registers" routine used by the Apply
-        // button, checkbox toggles (indirectly) and the OK action.
-        let apply = {
+        // Apply the typed value (number / string) and write the registers.
+        let apply_typed = Rc::new({
             let store = store.clone();
             let table = table.clone();
             let bit_editor = bit_editor.clone();
             let num_input = num_input.clone();
             let str_input = str_input.clone();
-            move |_window: &mut Window, cx: &mut App| -> Result<Vec<u16>, String> {
-                let (ty, text) = {
+            let hex_input = hex_input.clone();
+            move |window: &mut Window, cx: &mut App| -> Result<Vec<u16>, String> {
+                let text = {
                     let e = bit_editor.read(cx);
-                    (
-                        e.value_type,
-                        if e.value_type == ValueType::String {
-                            str_input.read(cx).value().to_string()
-                        } else {
-                            num_input.read(cx).value().to_string()
-                        },
-                    )
+                    if e.value_type == ValueType::String {
+                        str_input.read(cx).value().to_string()
+                    } else {
+                        num_input.read(cx).value().to_string()
+                    }
                 };
                 let result = {
                     let mut s = store.write().unwrap();
@@ -838,23 +949,91 @@ impl AppView {
                         }
                         cx.notify();
                     });
+                    let hex = bit_editor.read(cx).hex_text();
+                    hex_input.update(cx, |s, cx| s.set_value(hex, window, cx));
                 }
-                let _ = ty;
                 result
             }
-        };
+        });
+
+        // Apply raw hex register words and write them.
+        let apply_hex = Rc::new({
+            let store = store.clone();
+            let table = table.clone();
+            let bit_editor = bit_editor.clone();
+            let hex_input = hex_input.clone();
+            let num_input = num_input.clone();
+            let str_input = str_input.clone();
+            move |window: &mut Window, cx: &mut App| -> Result<Vec<u16>, String> {
+                let text = hex_input.read(cx).value().to_string();
+                let words = parse_hex_words(&text)?;
+                let expected = bit_editor.read(cx).registers();
+                if words.len() != expected {
+                    return Err(format!(
+                        "应输入 {expected} 个寄存器字，实际 {} 个",
+                        words.len()
+                    ));
+                }
+                let result = {
+                    let mut s = store.write().unwrap();
+                    bit_editor.update(cx, |e, _| {
+                        e.set_words(&words);
+                        e.apply_words(&mut s)
+                    })
+                };
+                if let Ok(_) = &result {
+                    let addr = bit_editor.read(cx).addr;
+                    table.update(cx, |t, cx| {
+                        for (k, w) in words.iter().enumerate() {
+                            t.delegate_mut().poke_row(addr + k, *w, "UI");
+                        }
+                        cx.notify();
+                    });
+                    let text = bit_editor.read(cx).bits_text();
+                    let is_string = bit_editor.read(cx).value_type == ValueType::String;
+                    if is_string {
+                        str_input.update(cx, |s, cx| s.set_value(text, window, cx));
+                    } else {
+                        num_input.update(cx, |s, cx| s.set_value(text, window, cx));
+                    }
+                }
+                result
+            }
+        });
+
+        // Apply the current in-memory bit pattern (used by OK in bit mode).
+        let apply_words = Rc::new({
+            let store = store.clone();
+            let table = table.clone();
+            let bit_editor = bit_editor.clone();
+            move |_window: &mut Window, cx: &mut App| -> Result<Vec<u16>, String> {
+                let result = {
+                    let mut s = store.write().unwrap();
+                    bit_editor.update(cx, |e, _| e.apply_words(&mut s))
+                };
+                if let Ok(words) = &result {
+                    let addr = bit_editor.read(cx).addr;
+                    table.update(cx, |t, cx| {
+                        for (k, w) in words.iter().enumerate() {
+                            t.delegate_mut().poke_row(addr + k, *w, "UI");
+                        }
+                        cx.notify();
+                    });
+                }
+                result
+            }
+        });
 
         window.open_dialog(cx, move |dialog, _window, _cx| {
             let bits = bit_editor.read(_cx);
-            let width = bits.width;
-            let nbits = width.bits();
             let vt = bits.value_type;
             let is_string = vt == ValueType::String;
-            let current = bits.value_u32();
-            let hex = match width {
-                DataWidth::Bits16 => format!("0x{:04X}", current as u16),
-                DataWidth::Bits32 => format!("0x{:08X}", current),
-            };
+            let nbits = bits.bits.len();
+            let regs = bits.registers();
+            let byte_len = bits.byte_len();
+            let view_mode = bits.view_mode;
+            let hex = bits.hex_text();
+            let order = order_code.clone();
 
             // Data type selector row.
             let type_row = h_flex()
@@ -872,6 +1051,70 @@ impl AppView {
                         .menu_width(gpui::rems(17.)),
                 );
 
+            // `String(N)` length row (only for strings).
+            let str_len_row = if is_string {
+                h_flex()
+                    .gap_2()
+                    .items_center()
+                    .child(
+                        div()
+                            .text_size(px(13.))
+                            .text_color(_cx.theme().muted_foreground)
+                            .child("字符数 / 字节数 (String(N))"),
+                    )
+                    .child(div().flex_1())
+                    .child(div().w(px(120.)).child(Input::new(&str_len_input).small()))
+                    .into_any_element()
+            } else {
+                div().into_any_element()
+            };
+
+            // Bit / Hex display-mode toggle.
+            let mode_row = h_flex()
+                .gap_2()
+                .items_center()
+                .child(
+                    div()
+                        .text_size(px(13.))
+                        .text_color(_cx.theme().muted_foreground)
+                        .child("显示方式"),
+                )
+                .child(
+                    Button::new("mode-bits")
+                        .small()
+                        .when(view_mode == ViewMode::Bits, |b| b.primary())
+                        .when(view_mode != ViewMode::Bits, |b| b.ghost())
+                        .label("位编辑")
+                        .on_click({
+                            let editor = bit_editor.clone();
+                            move |_, _window, cx| {
+                                editor.update(cx, |e, _| e.view_mode = ViewMode::Bits);
+                                _window.refresh();
+                            }
+                        }),
+                )
+                .child(
+                    Button::new("mode-hex")
+                        .small()
+                        .when(view_mode == ViewMode::Hex, |b| b.primary())
+                        .when(view_mode != ViewMode::Hex, |b| b.ghost())
+                        .label("16进制")
+                        .on_click({
+                            let editor = bit_editor.clone();
+                            move |_, _window, cx| {
+                                editor.update(cx, |e, _| e.view_mode = ViewMode::Hex);
+                                _window.refresh();
+                            }
+                        }),
+                )
+                .child(div().flex_1())
+                .child(
+                    div()
+                        .text_size(px(12.))
+                        .text_color(_cx.theme().muted_foreground)
+                        .child(format!("{regs} 寄存器 · {byte_len} 字节")),
+                );
+
             // Typed input (number or string) + auto-fill button.
             let typed_row = h_flex()
                 .gap_2()
@@ -887,8 +1130,8 @@ impl AppView {
                         .primary()
                         .label("填充")
                         .on_click({
-                            let apply = apply.clone();
-                            move |_, window, cx| match apply(window, cx) {
+                            let apply_typed = apply_typed.clone();
+                            move |_, window, cx| match apply_typed(window, cx) {
                                 Ok(words) => {
                                     window.push_notification(
                                         Notification::success(format!(
@@ -906,14 +1149,14 @@ impl AppView {
                 );
 
             // Value preview line.
-            let value_line = h_flex()
+            let preview_row = h_flex()
                 .gap_2()
                 .items_center()
                 .child(
                     div()
                         .text_size(px(12.))
                         .text_color(_cx.theme().muted_foreground)
-                        .child(format!("{} · 字节序 {}", vt.label(), order_code)),
+                        .child(format!("{} · 字节序 {}", vt.label(), order)),
                 )
                 .child(div().flex_1())
                 .child(
@@ -921,6 +1164,45 @@ impl AppView {
                         .text_size(px(15.))
                         .font_weight(gpui::FontWeight::BOLD)
                         .child(hex),
+                );
+
+            // Hex editor panel (shown in Hex mode).
+            let hex_editor = v_flex()
+                .gap_2()
+                .child(
+                    h_flex()
+                        .gap_2()
+                        .items_center()
+                        .child(div().flex_1().child(Input::new(&hex_input).flex_1()))
+                        .child(
+                            Button::new("apply-hex")
+                                .small()
+                                .primary()
+                                .label("应用16进制")
+                                .on_click({
+                                    let apply_hex = apply_hex.clone();
+                                    move |_, window, cx| match apply_hex(window, cx) {
+                                        Ok(w) => {
+                                            window.push_notification(
+                                                Notification::success(format!(
+                                                    "已写入 {} 个寄存器",
+                                                    w.len()
+                                                )),
+                                                cx,
+                                            );
+                                        }
+                                        Err(e) => {
+                                            window.push_notification(Notification::warning(e), cx);
+                                        }
+                                    }
+                                }),
+                        ),
+                )
+                .child(
+                    div()
+                        .text_size(px(12.))
+                        .text_color(_cx.theme().muted_foreground)
+                        .child("按寄存器字输入 16 位十六进制，空格分隔，如 1234 5678"),
                 );
 
             // Bit grid: 8 bits per row.
@@ -936,6 +1218,7 @@ impl AppView {
                             let editor = bit_editor.clone();
                             let num_input = num_input.clone();
                             let str_input = str_input.clone();
+                            let hex_input = hex_input.clone();
                             div()
                                 .flex_row()
                                 .content_center()
@@ -945,9 +1228,9 @@ impl AppView {
                                         .large()
                                         .checked(bits.bits[i])
                                         .on_click(move |&on, w, cx| {
-                                            let text = editor.update(cx, |e, _| {
+                                            let (text, hex) = editor.update(cx, |e, _| {
                                                 e.set_bit(i, on);
-                                                e.bits_text()
+                                                (e.bits_text(), e.hex_text())
                                             });
                                             if is_string {
                                                 str_input
@@ -956,6 +1239,8 @@ impl AppView {
                                                 num_input
                                                     .update(cx, |s, cx| s.set_value(text, w, cx));
                                             }
+                                            hex_input
+                                                .update(cx, |s, cx| s.set_value(hex, w, cx));
                                         }),
                                 )
                                 .text_color(_cx.theme().muted_foreground)
@@ -980,6 +1265,34 @@ impl AppView {
                         .child(format!("{} 位", nbits)),
                 );
 
+            let editor_panel = if view_mode == ViewMode::Hex {
+                hex_editor.into_any_element()
+            } else {
+                v_flex()
+                    .gap_2()
+                    .child(grid_label)
+                    .child(
+                        v_flex()
+                            .border_1()
+                            .border_color(_cx.theme().border)
+                            .rounded(_cx.theme().radius)
+                            .p_3()
+                            .gap_2()
+                            .children(bit_rows),
+                    )
+                    .into_any_element()
+            };
+
+            let footer = div()
+                .text_size(px(12.))
+                .text_color(_cx.theme().muted_foreground)
+                .child(format!(
+                    "占用 {regs} 个寄存器 (地址 {:#06X} ~ {:#06X}) · {byte_len} 字节 · {}",
+                    row_addr,
+                    row_addr + regs - 1,
+                    vt.label_zh(),
+                ));
+
             dialog
                 .title(format!("编辑寄存器 · {area_zh} · 地址 {row_addr:#06X}"))
                 .width(px(640.))
@@ -988,41 +1301,31 @@ impl AppView {
                         .gap_3()
                         .px_2()
                         .child(type_row)
+                        .child(str_len_row)
+                        .child(mode_row)
                         .child(typed_row)
-                        .child(value_line)
-                        .child(grid_label)
-                        .child(
-                            v_flex()
-                                .border_1()
-                                .border_color(_cx.theme().border)
-                                .rounded(_cx.theme().radius)
-                                .p_3()
-                                .gap_2()
-                                .children(bit_rows),
-                        )
-                        .child(
-                            div()
-                                .text_size(px(12.))
-                                .text_color(_cx.theme().muted_foreground)
-                                .child(format!(
-                                    "占用 {} 个寄存器 (地址 {:#06X} ~ {:#06X}) · {}",
-                                    bits.registers(),
-                                    row_addr,
-                                    row_addr + bits.registers() - 1,
-                                    vt.label_zh(),
-                                )),
-                        ),
+                        .child(preview_row)
+                        .child(editor_panel)
+                        .child(footer),
                 )
                 .on_ok({
-                    let apply = apply.clone();
-                    move |_, window, cx| match apply(window, cx) {
-                        Ok(_) => {
-                            window.close_dialog(cx);
-                            true
-                        }
-                        Err(e) => {
-                            window.push_notification(Notification::warning(e), cx);
-                            false
+                    let apply_hex = apply_hex.clone();
+                    let apply_words = apply_words.clone();
+                    move |_, window, cx| {
+                        let result = if view_mode == ViewMode::Hex {
+                            apply_hex(window, cx)
+                        } else {
+                            apply_words(window, cx)
+                        };
+                        match result {
+                            Ok(_) => {
+                                window.close_dialog(cx);
+                                true
+                            }
+                            Err(e) => {
+                                window.push_notification(Notification::warning(e), cx);
+                                false
+                            }
                         }
                     }
                 })
@@ -1040,6 +1343,33 @@ impl AppView {
     ) -> impl IntoElement {
         let theme = cx.theme();
         let dark = Theme::global(cx).is_dark();
+
+        // The draggable region: title block + spacer. Marked as a native
+        // window-control drag area so Windows handles the move on `titlebar:
+        // None` client-decorated windows; the buttons live outside it so they
+        // stay clickable.
+        let drag_area = h_flex()
+            .id("title-bar-drag")
+            .flex_1()
+            .min_w_0()
+            .gap_2()
+            .items_center()
+            .window_control_area(WindowControlArea::Drag)
+            .child(Icon::new(IconName::LayoutDashboard).text_color(theme.primary))
+            .child(
+                div()
+                    .text_size(px(18.))
+                    .font_weight(gpui::FontWeight::BOLD)
+                    .child("IoT 协议模拟器"),
+            )
+            .child(
+                div()
+                    .text_size(px(12.))
+                    .text_color(theme.muted_foreground)
+                    .flex_1()
+                    .child("Modbus TCP 仿真 · 可扩展 S7 / OPC-UA"),
+            );
+
         h_flex()
             .h(px(44.))
             .px_3()
@@ -1048,25 +1378,7 @@ impl AppView {
             .border_b_1()
             .border_color(theme.border)
             .bg(theme.sidebar)
-            .child(
-                h_flex()
-                    .gap_2()
-                    .items_center()
-                    .child(Icon::new(IconName::LayoutDashboard).text_color(theme.primary))
-                    .child(
-                        div()
-                            .text_size(px(18.))
-                            .font_weight(gpui::FontWeight::BOLD)
-                            .child("IoT 协议模拟器"),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(12.))
-                            .text_color(theme.muted_foreground)
-                            .child("Modbus TCP 仿真 · 可扩展 S7 / OPC-UA"),
-                    ),
-            )
-            .child(div().flex_1())
+            .child(drag_area)
             .child(
                 Button::new("theme-toggle")
                     .ghost()

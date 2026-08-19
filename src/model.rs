@@ -281,6 +281,11 @@ impl ValueType {
     }
 }
 
+/// Number of 16-bit registers needed to hold `bytes` bytes (2 bytes per word).
+pub fn bytes_to_regs(bytes: usize) -> usize {
+    (bytes + 1) / 2
+}
+
 /// Encode a UTF-8 string into registers (2 bytes per register, big-endian per
 /// word), advancing over `max_regs` registers. Returns an error if the string
 /// needs more registers than allowed.
@@ -300,6 +305,45 @@ fn store_string(s: &str, byte_order: ByteOrder, max_regs: usize) -> Result<Vec<u
         .map(|i| match byte_order {
             ByteOrder::Abcd | ByteOrder::Badc => u16::from_be_bytes([bytes[2 * i], bytes[2 * i + 1]]),
             ByteOrder::Cdab | ByteOrder::Dcba => u16::from_be_bytes([bytes[2 * i + 1], bytes[2 * i]]),
+        })
+        .collect())
+}
+
+/// Encode a UTF-8 string into a fixed-width buffer of `max_bytes` bytes,
+/// honouring that capacity. This backs `String(N)` values: the value occupies
+/// `bytes_to_regs(N)` registers (a short string is NUL-padded to the full
+/// width). Errors when the string is longer than the buffer or the registers
+/// would run past `max_regs`.
+pub fn encode_string_fixed(
+    s: &str,
+    byte_order: ByteOrder,
+    max_regs: usize,
+    max_bytes: usize,
+) -> Result<Vec<u16>, String> {
+    let n = s.as_bytes().len();
+    if n > max_bytes {
+        return Err(format!(
+            "字符串长度超出上限：{n} 字节 > 上限 {max_bytes} 字节"
+        ));
+    }
+    let width = bytes_to_regs(max_bytes);
+    if width > max_regs {
+        return Err(format!(
+            "字符串需占用 {width} 个寄存器，超出上限 {max_regs} 个"
+        ));
+    }
+    let mut buf = s.as_bytes().to_vec();
+    while buf.len() < max_bytes {
+        buf.push(0);
+    }
+    if !buf.len().is_multiple_of(2) {
+        buf.push(0);
+    }
+    let words = buf.len() / 2;
+    Ok((0..words)
+        .map(|i| match byte_order {
+            ByteOrder::Abcd | ByteOrder::Badc => u16::from_be_bytes([buf[2 * i], buf[2 * i + 1]]),
+            ByteOrder::Cdab | ByteOrder::Dcba => u16::from_be_bytes([buf[2 * i + 1], buf[2 * i]]),
         })
         .collect())
 }
@@ -774,5 +818,40 @@ mod tests {
     fn value_type_invalid_number_rejected() {
         assert!(ValueType::Uint16.encode_text("abc", ByteOrder::Abcd, 1).is_err());
         assert!(ValueType::Float32.encode_text("12.5x", ByteOrder::Abcd, 2).is_err());
+    }
+
+    #[test]
+    fn bytes_to_regs_rounds_up() {
+        assert_eq!(bytes_to_regs(1), 1);
+        assert_eq!(bytes_to_regs(2), 1);
+        assert_eq!(bytes_to_regs(7), 4);
+        assert_eq!(bytes_to_regs(8), 4);
+        assert_eq!(bytes_to_regs(5), 3);
+    }
+
+    #[test]
+    fn encode_string_fixed_pads_to_width() {
+        // String(7) -> 7 bytes -> 4 registers, short "Hi" NUL-padded.
+        let words = encode_string_fixed("Hi", ByteOrder::Abcd, 8, 7).unwrap();
+        assert_eq!(words.len(), 4);
+        assert_eq!(words, vec![0x4869, 0x0000, 0x0000, 0x0000]);
+        assert_eq!(ValueType::String.decode_words(&words, ByteOrder::Abcd), "Hi");
+    }
+
+    #[test]
+    fn encode_string_fixed_rejects_overflow() {
+        // "HelloWorld" is 10 bytes > 7-byte buffer.
+        assert!(encode_string_fixed("HelloWorld", ByteOrder::Abcd, 8, 7).is_err());
+        // 8 registers needed for String(16); budget is 4 -> rejected.
+        assert!(encode_string_fixed("abc", ByteOrder::Abcd, 4, 16).is_err());
+    }
+
+    #[test]
+    fn encode_string_fixed_respects_byte_order() {
+        for bo in ByteOrder::ALL {
+            let words = encode_string_fixed("AB", bo, 8, 2).unwrap();
+            assert_eq!(words.len(), 1);
+            assert_eq!(ValueType::String.decode_words(&words, bo), "AB");
+        }
     }
 }
