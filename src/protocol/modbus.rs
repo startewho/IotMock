@@ -36,7 +36,10 @@ use tokio::{
 
 use crate::model::{Area, SharedStore};
 
-use super::{Protocol, ProtocolContext, ServerState, ServerStats};
+use super::{
+    log_message, timestamp, MessageLogEntry, MsgDirection, Protocol, ProtocolContext, ServerState,
+    ServerStats, SharedMessageLog,
+};
 
 /// Default Modbus TCP port.
 pub const DEFAULT_PORT: u16 = 502;
@@ -109,12 +112,13 @@ impl Protocol for ModbusTcpServer {
 
         let store = ctx.store.clone();
         let stats = ctx.stats.clone();
+        let logs = ctx.logs.clone();
         let running = self.running.clone();
         let state = self.state.clone();
 
         running.store(true, Ordering::Relaxed);
         let handle = rt.spawn(async move {
-            run_tcp_server(port, store, stats, running, state).await;
+            run_tcp_server(port, store, stats, logs, running, state).await;
         });
 
         *self.runtime.lock().unwrap() = Some(RuntimeHandle { rt, _join: handle });
@@ -163,6 +167,7 @@ async fn run_tcp_server(
     port: u16,
     store: SharedStore,
     stats: Arc<ServerStats>,
+    logs: SharedMessageLog,
     running: Arc<AtomicBool>,
     state: Arc<Mutex<ServerState>>,
 ) {
@@ -184,8 +189,9 @@ async fn run_tcp_server(
                 let store = store.clone();
                 let stats = stats.clone();
                 let running = running.clone();
+                let logs = logs.clone();
                 tokio::spawn(async move {
-                    handle_connection(stream, peer, store, stats, running).await;
+                    handle_connection(stream, peer, store, stats, logs, running).await;
                 });
             }
             Err(e) => {
@@ -202,6 +208,7 @@ async fn handle_connection(
     peer: SocketAddr,
     store: SharedStore,
     stats: Arc<ServerStats>,
+    logs: SharedMessageLog,
     _running: Arc<AtomicBool>,
 ) {
     stats.client_connected();
@@ -242,11 +249,42 @@ async fn handle_connection(
 
         stats.requests(1);
 
+        // Log the received request frame (MBAP + PDU).
+        {
+            let full = [&header[..], &pdu].concat();
+            let fc = pdu.first().copied().unwrap_or(0);
+            let registers = estimate_registers(&pdu);
+            log_message(
+                &logs,
+                MessageLogEntry {
+                    direction: MsgDirection::Received,
+                    function_code: fc,
+                    bytes: full.len(),
+                    registers,
+                    hex: hex_str(&full),
+                    time: timestamp(),
+                },
+            );
+        }
+
         let mut out = Vec::with_capacity(7 + response.len());
         out.extend_from_slice(&[header[0], header[1], 0x00, 0x00]);
         out.extend_from_slice(&((1 + response.len()) as u16).to_be_bytes());
         out.push(uid);
         out.extend_from_slice(&response);
+
+        // Log the sent response frame (MBAP + PDU).
+        log_message(
+            &logs,
+            MessageLogEntry {
+                direction: MsgDirection::Sent,
+                function_code: response.first().or(pdu.first()).copied().unwrap_or(0),
+                bytes: out.len(),
+                registers: register_count_of_response(&response),
+                hex: hex_str(&out),
+                time: timestamp(),
+            },
+        );
 
         if stream.write_all(&out).await.is_err() {
             break;
@@ -475,6 +513,58 @@ fn write_multiple_words(
 /// keep it static for a compact UI column.
 fn writer(_uid: u8) -> String {
     "Modbus TCP".to_string()
+}
+
+/// Render bytes as space-separated big-endian hex, e.g. `"01 03 00 0A"`.
+fn hex_str(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .map(|b| format!("{b:02X}"))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Best-effort register estimate for a received request PDU: for a read it's the
+/// quantity, for a write it's the byte count / 2, otherwise 0.
+fn estimate_registers(pdu: &[u8]) -> usize {
+    if pdu.len() < 5 {
+        return 0;
+    }
+    match pdu[0] {
+        0x01 | 0x02 | 0x03 | 0x04 => {
+            u16::from_be_bytes([pdu[3], pdu[4]]) as usize
+        }
+        0x05 | 0x06 => 1,
+        0x0F => {
+            let bc = pdu.get(5).copied().unwrap_or(0) as usize;
+            bc * 8
+        }
+        0x10 => {
+            let bc = pdu.get(5).copied().unwrap_or(0) as usize;
+            bc / 2
+        }
+        _ => 0,
+    }
+}
+
+/// Number of register words in a response PDU: for a read-registers response it's
+/// the byte count / 2; for coils it's the bit count; otherwise 0.
+fn register_count_of_response(resp: &[u8]) -> usize {
+    if resp.len() < 2 {
+        return 0;
+    }
+    match resp[0] {
+        0x01 | 0x02 => {
+            let bc = resp.get(1).copied().unwrap_or(0) as usize;
+            bc * 8
+        }
+        0x03 | 0x04 => {
+            let bc = resp.get(1).copied().unwrap_or(0) as usize;
+            bc / 2
+        }
+        0x05 | 0x06 => 1,
+        _ => 0,
+    }
 }
 
 /// A parsed Modbus TCP frame used by the hex-decoder dialog.

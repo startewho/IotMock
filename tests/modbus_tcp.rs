@@ -54,6 +54,7 @@ fn server_end_to_end_reads_and_writes() {
     let started = server.start(&ProtocolContext {
         store: store.clone(),
         stats: stats.clone(),
+        logs: iot_mock::protocol::shared_message_log(),
     });
     assert!(started.is_ok(), "start failed: {started:?}");
 

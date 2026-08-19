@@ -33,7 +33,8 @@ use iot_mock::model::{
 };
 use iot_mock::protocol::{
     modbus::{parse_modbus_hex, ModbusFrameParse, ModbusTcpServer, DEFAULT_PORT},
-    ProtocolCard, ProtocolContext, ServerState, ServerStats,
+    shared_message_log, MessageLogEntry, MsgDirection, ProtocolCard, ProtocolContext,
+    ServerState, ServerStats, SharedMessageLog,
 };
 
 /// UI refresh interval (milliseconds).
@@ -185,6 +186,192 @@ fn match_byte_order(vt: ValueType, words: &[u16], min: f64, max: f64) -> Option<
         }
     }
     None
+}
+
+/// Truncate a space-separated hex string to at most `max_len` chars, appending
+/// `…` when it was cut.
+fn truncate_hex(hex: &str, max_len: usize) -> String {
+    if hex.chars().count() <= max_len {
+        hex.to_string()
+    } else {
+        let mut out: String = hex.chars().take(max_len).collect();
+        out.push('…');
+        out
+    }
+}
+
+/// A local newtype so a raw function code (`u8`) can be a [`SelectItem`].
+#[derive(Clone, Copy)]
+struct GenFcItem(u8);
+
+impl GenFcItem {
+    fn all() -> Vec<Self> {
+        [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x0F, 0x10]
+            .into_iter()
+            .map(Self)
+            .collect()
+    }
+
+    fn name(self) -> &'static str {
+        function_code_label(self.0)
+    }
+}
+
+impl SelectItem for GenFcItem {
+    type Value = u8;
+
+    fn title(&self) -> gpui::SharedString {
+        format!("{:#04X} · {}", self.0, self.name()).into()
+    }
+
+    fn value(&self) -> &u8 {
+        &self.0
+    }
+}
+
+/// Short Chinese label for a Modbus function code.
+fn function_code_label(fc: u8) -> &'static str {
+    match fc {
+        0x01 => "读线圈",
+        0x02 => "读离散输入",
+        0x03 => "读保持寄存器",
+        0x04 => "读输入寄存器",
+        0x05 => "写单个线圈",
+        0x06 => "写单个寄存器",
+        0x0F => "写多个线圈",
+        0x10 => "写多个寄存器",
+        _ => "未知",
+    }
+}
+
+/// Encode a typed value (numeric or string) into register words for writing.
+fn encode_generator_words(
+    vt: ValueType,
+    text: &str,
+    bo: ByteOrder,
+    string_chars: usize,
+) -> Result<Vec<u16>, String> {
+    if vt == ValueType::String {
+        encode_string_fixed(text, bo, 64, string_chars)
+    } else {
+        vt.encode_text(text, bo, 8)
+    }
+}
+
+/// Parse a coil bit string like `"1011"` / `"1,0,1,1"` into `qty` bits
+/// (LSB first; missing bits treated as 0).
+fn parse_bit_string(text: &str, qty: u16) -> Result<Vec<bool>, String> {
+    let cleaned: String = text
+        .chars()
+        .filter(|c| *c == '0' || *c == '1' || *c == ',')
+        .collect();
+    let bits: Vec<bool> = cleaned
+        .chars()
+        .filter(|&c| c == '0' || c == '1')
+        .map(|c| c == '1')
+        .collect();
+    if bits.is_empty() {
+        return Err("请输入位串（如 1011 或 1,0,1,1）".to_string());
+    }
+    let mut out = vec![false; qty as usize];
+    for (i, &b) in bits.iter().take(qty as usize).enumerate() {
+        out[i] = b;
+    }
+    Ok(out)
+}
+
+/// Pack bits (LSB first) into bytes, Modbus coil style.
+fn pack_bits(bits: &[bool]) -> Vec<u8> {
+    let nbytes = (bits.len() + 7) / 8;
+    let mut bytes = vec![0u8; nbytes];
+    for (i, &b) in bits.iter().enumerate() {
+        if b {
+            bytes[i / 8] |= 1 << (i % 8);
+        }
+    }
+    bytes
+}
+
+/// Build the PDU and the full Modbus TCP frame (MBAP + PDU) for a request with
+/// the given configuration. Returns `(pdu, full_frame)`.
+fn build_modbus_frames(
+    tx: u16,
+    unit: u8,
+    fc: u8,
+    addr: u16,
+    qty: u16,
+    value_text: &str,
+    vt: ValueType,
+    bo: ByteOrder,
+    string_chars: usize,
+) -> Result<(Vec<u8>, Vec<u8>), String> {
+    let pdu = match fc {
+        0x01 | 0x02 | 0x03 | 0x04 => {
+            vec![fc, (addr >> 8) as u8, addr as u8, (qty >> 8) as u8, qty as u8]
+        }
+        0x05 => {
+            let s = value_text.trim();
+            let v = if s.eq_ignore_ascii_case("on")
+                || s.eq_ignore_ascii_case("true")
+                || s == "1"
+                || s == "255"
+            {
+                0xFF00u16
+            } else {
+                0x0000u16
+            };
+            vec![fc, (addr >> 8) as u8, addr as u8, (v >> 8) as u8, v as u8]
+        }
+        0x06 => {
+            let w = encode_generator_words(vt, value_text, bo, string_chars)?
+                .first()
+                .copied()
+                .unwrap_or(0);
+            vec![fc, (addr >> 8) as u8, addr as u8, (w >> 8) as u8, w as u8]
+        }
+        0x0F => {
+            let bits = parse_bit_string(value_text, qty)?;
+            let data = pack_bits(&bits);
+            let mut p =
+                vec![fc, (addr >> 8) as u8, addr as u8, (qty >> 8) as u8, qty as u8, data.len() as u8];
+            p.extend_from_slice(&data);
+            p
+        }
+        0x10 => {
+            let words = encode_generator_words(vt, value_text, bo, string_chars)?;
+            let mut data: Vec<u8> = Vec::with_capacity(words.len() * 2);
+            for w in &words {
+                data.extend_from_slice(&w.to_be_bytes());
+            }
+            let mut p = vec![
+                fc,
+                (addr >> 8) as u8,
+                addr as u8,
+                (qty >> 8) as u8,
+                qty as u8,
+                data.len() as u8,
+            ];
+            p.extend_from_slice(&data);
+            p
+        }
+        _ => return Err("不支持的功能码".to_string()),
+    };
+
+    // MBAP: tx id, protocol id 0, length = unit byte + PDU, unit id, PDU.
+    let frame_len = 1 + pdu.len();
+    let mut frame = Vec::with_capacity(7 + pdu.len());
+    frame.extend_from_slice(&tx.to_be_bytes());
+    frame.extend_from_slice(&[0x00, 0x00]);
+    frame.extend_from_slice(&(frame_len as u16).to_be_bytes());
+    frame.push(unit);
+    frame.extend_from_slice(&pdu);
+
+    Ok((pdu, frame))
+}
+
+/// Render bytes as big-endian hex (space separated).
+fn hex_bytes(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{b:02X}")).collect::<Vec<_>>().join(" ")
 }
 
 /// The register table delegate: columns + per-area row rendering.
@@ -685,6 +872,10 @@ impl ParserState {
 pub struct AppView {
     store: SharedStore,
     stats: Arc<ServerStats>,
+    /// Shared message log (received/sent frames) rendered in the bottom panel.
+    logs: SharedMessageLog,
+    /// Whether the bottom message-log panel is expanded.
+    log_expanded: Arc<AtomicBool>,
     protocols: Vec<ProtocolCard>,
     port_inputs: Vec<Entity<InputState>>,
     /// One byte-order dropdown per protocol, applied when the server starts.
@@ -714,6 +905,16 @@ pub struct AppView {
     parser_range_min_input: Entity<InputState>,
     /// Numeric auto-range upper bound for byte-order matching (default 10000).
     parser_range_max_input: Entity<InputState>,
+    /// Message generator dialog config.
+    gen_fc_select: Entity<SelectState<Vec<GenFcItem>>>,
+    gen_type_select: Entity<SelectState<Vec<ValueTypeItem>>>,
+    gen_order_select: Entity<SelectState<Vec<ByteOrderItem>>>,
+    gen_tx_input: Entity<InputState>,
+    gen_unit_input: Entity<InputState>,
+    gen_addr_input: Entity<InputState>,
+    gen_qty_input: Entity<InputState>,
+    gen_value_input: Entity<InputState>,
+    gen_str_len_input: Entity<InputState>,
     table: Entity<TableState<RegTableDelegate>>,
     active_area: Area,
     selected_row: Option<usize>,
@@ -727,6 +928,8 @@ impl AppView {
     pub fn new(window: &mut Window, cx: &mut Context<Self>) -> Self {
         let store = shared_store(DEFAULT_AREA_SIZE);
         let stats = Arc::new(ServerStats::default());
+        let logs = shared_message_log();
+        let log_expanded = Arc::new(AtomicBool::new(true));
 
         // -- protocol servers -------------------------------------------------
         // Extension point: add more `ProtocolCard`s here (e.g. S7, OPC-UA...).
@@ -822,6 +1025,38 @@ impl AppView {
         let parser_range_min_input = cx.new(|cx| InputState::new(window, cx).default_value("0"));
         let parser_range_max_input =
             cx.new(|cx| InputState::new(window, cx).default_value("10000"));
+
+        // Message generator dialog entities.
+        let gen_fc_select = cx.new(|cx| {
+            let items = GenFcItem::all();
+            SelectState::new(items, Some(IndexPath::default().row(2)), window, cx)
+        });
+        let gen_type_items = ValueType::ALL
+            .iter()
+            .map(|&v| ValueTypeItem(v))
+            .collect::<Vec<_>>();
+        let gen_type_select = cx.new(|cx| {
+            SelectState::new(
+                gen_type_items,
+                Some(IndexPath::default().row(0)),
+                window,
+                cx,
+            )
+        });
+        let gen_order_items = ByteOrder::ALL
+            .iter()
+            .map(|&b| ByteOrderItem(b))
+            .collect::<Vec<_>>();
+        let gen_order_select = cx.new(|cx| {
+            SelectState::new(gen_order_items, Some(IndexPath::default().row(0)), window, cx)
+        });
+        let gen_tx_input = cx.new(|cx| InputState::new(window, cx).default_value("1"));
+        let gen_unit_input = cx.new(|cx| InputState::new(window, cx).default_value("1"));
+        let gen_addr_input = cx.new(|cx| InputState::new(window, cx).default_value("0"));
+        let gen_qty_input = cx.new(|cx| InputState::new(window, cx).default_value("1"));
+        let gen_value_input =
+            cx.new(|cx| InputState::new(window, cx).placeholder("数值 / 字符串 / 位串（写入）"));
+        let gen_str_len_input = cx.new(|cx| InputState::new(window, cx).default_value("7"));
         // Pre-parse the default example right away.
         {
             let hex = parser_hex_input.read(cx).value().to_string();
@@ -975,6 +1210,8 @@ impl AppView {
         let mut this = Self {
             store,
             stats,
+            logs,
+            log_expanded,
             protocols,
             port_inputs,
             byte_order_selects,
@@ -991,6 +1228,15 @@ impl AppView {
             parser_str_len_input,
             parser_range_min_input,
             parser_range_max_input,
+            gen_fc_select,
+            gen_type_select,
+            gen_order_select,
+            gen_tx_input,
+            gen_unit_input,
+            gen_addr_input,
+            gen_qty_input,
+            gen_value_input,
+            gen_str_len_input,
             table,
             active_area: Area::HoldingRegisters,
             selected_row: None,
@@ -1083,6 +1329,7 @@ impl AppView {
         let ctx = ProtocolContext {
             store: self.store.clone(),
             stats: self.stats.clone(),
+            logs: self.logs.clone(),
         };
 
         match card.protocol.start(&ctx) {
@@ -2142,6 +2389,247 @@ impl AppView {
         });
     }
 
+    /// Open the Modbus request / message generator dialog: configure function
+    /// code, type and byte order, then get the request PDU and the full TCP
+    /// frame to send, with copy-to-clipboard buttons.
+    fn open_generator_dialog(&mut self, window: &mut Window, cx: &mut Context<Self>) {
+        let gen_fc_select = self.gen_fc_select.clone();
+        let gen_type_select = self.gen_type_select.clone();
+        let gen_order_select = self.gen_order_select.clone();
+        let gen_tx_input = self.gen_tx_input.clone();
+        let gen_unit_input = self.gen_unit_input.clone();
+        let gen_addr_input = self.gen_addr_input.clone();
+        let gen_qty_input = self.gen_qty_input.clone();
+        let gen_value_input = self.gen_value_input.clone();
+        let gen_str_len_input = self.gen_str_len_input.clone();
+
+        window.open_dialog(cx, move |dialog, _window, _cx| {
+            let fc = gen_fc_select
+                .read(_cx)
+                .selected_value()
+                .copied()
+                .unwrap_or(0x03);
+            let vt = gen_type_select
+                .read(_cx)
+                .selected_value()
+                .copied()
+                .unwrap_or_default();
+            let bo = gen_order_select
+                .read(_cx)
+                .selected_value()
+                .copied()
+                .unwrap_or_default();
+            let is_read = matches!(fc, 0x01 | 0x02 | 0x03 | 0x04);
+            let is_string = vt == ValueType::String;
+
+            let tx: u16 = gen_tx_input
+                .read(_cx)
+                .value()
+                .to_string()
+                .trim()
+                .parse()
+                .unwrap_or(1);
+            let unit: u8 = gen_unit_input
+                .read(_cx)
+                .value()
+                .to_string()
+                .trim()
+                .parse()
+                .unwrap_or(1);
+            let addr: u16 = gen_addr_input
+                .read(_cx)
+                .value()
+                .to_string()
+                .trim()
+                .parse()
+                .unwrap_or(0);
+            let qty: u16 = gen_qty_input
+                .read(_cx)
+                .value()
+                .to_string()
+                .trim()
+                .parse()
+                .unwrap_or(1);
+            let value_text = gen_value_input.read(_cx).value().to_string();
+            let string_chars: usize = gen_str_len_input
+                .read(_cx)
+                .value()
+                .to_string()
+                .trim()
+                .parse()
+                .unwrap_or(7);
+
+            let result =
+                build_modbus_frames(tx, unit, fc, addr, qty, &value_text, vt, bo, string_chars);
+
+            let field = |label: &'static str, child: gpui::AnyElement, w: f32| {
+                v_flex()
+                    .gap_1()
+                    .child(
+                        div()
+                            .text_size(px(11.))
+                            .text_color(_cx.theme().muted_foreground)
+                            .child(label),
+                    )
+                    .child(div().w(px(w)).child(child))
+            };
+
+            // Function code + type + byte order row.
+            let select_row = h_flex()
+                .gap_3()
+                .items_end()
+                .child(field("功能码", Select::new(&gen_fc_select).small().menu_width(gpui::rems(24.)).into_any_element(), 260.0))
+                .child(field("数据类型", Select::new(&gen_type_select).small().menu_width(gpui::rems(12.)).into_any_element(), 150.0))
+                .child(field("字节序", Select::new(&gen_order_select).small().menu_width(gpui::rems(18.)).into_any_element(), 190.0));
+
+            // Header fields.
+            let header_row = h_flex()
+                .gap_3()
+                .items_end()
+                .child(field("事务ID", Input::new(&gen_tx_input).small().into_any_element(), 70.0))
+                .child(field("单元ID", Input::new(&gen_unit_input).small().into_any_element(), 70.0))
+                .child(field("起始地址", Input::new(&gen_addr_input).small().into_any_element(), 90.0))
+                .child(field("数量/长度", Input::new(&gen_qty_input).small().into_any_element(), 90.0));
+
+            // Value row (write function codes) + string length.
+            let value_row = if is_read {
+                div().into_any_element()
+            } else {
+                h_flex()
+                    .gap_3()
+                    .items_end()
+                    .child(
+                        h_flex()
+                            .gap_1()
+                            .items_end()
+                            .child(field("写入值", Input::new(&gen_value_input).small().into_any_element(), 220.0))
+                            .when(is_string, |this| {
+                                this.child(field(
+                                    "String(N)",
+                                    Input::new(&gen_str_len_input).small().into_any_element(),
+                                    70.0,
+                                ))
+                            }),
+                    )
+                    .child(div().flex_1())
+                    .child(
+                        div()
+                            .text_size(px(11.))
+                            .text_color(_cx.theme().muted_foreground)
+                            .child(if fc == 0x05 {
+                                "线圈：输入 ON/OFF/1/0".to_string()
+                            } else if matches!(fc, 0x0F | 0x10) {
+                                "写多：10 填数量个值/位串（字符串用 String(N)）".to_string()
+                            } else {
+                                "写入单个寄存器的值".to_string()
+                            }),
+                    )
+                    .into_any_element()
+            };
+
+            // Result display.
+            let (pdu_hex, frame_hex) = match &result {
+                Ok((pdu, frame)) => (hex_bytes(pdu), hex_bytes(frame)),
+                Err(_) => (String::new(), String::new()),
+            };
+            let error = match &result {
+                Err(e) => e.clone(),
+                Ok(_) => String::new(),
+            };
+
+            let ok = error.is_empty();
+
+            let result_pdu = h_flex()
+                .gap_2()
+                .items_center()
+                .child(
+                    div()
+                        .flex_1()
+                        .text_size(px(12.))
+                        .text_color(_cx.theme().muted_foreground)
+                        .child("请求 PDU（功能码 + 数据）"),
+                )
+                .child(
+                    div()
+                        .text_size(px(13.))
+                        .text_color(if ok { _cx.theme().green } else { _cx.theme().red })
+                        .child(if ok { pdu_hex.clone() } else { "—".to_string() }),
+                )
+                .child(
+                    Button::new("copy-pdu")
+                        .ghost()
+                        .small()
+                        .icon(IconName::Copy)
+                        .tooltip("复制请求 PDU")
+                        .disabled(!ok)
+                        .on_click({
+                            let pdu_hex = pdu_hex.clone();
+                            move |_, window, cx| {
+                                cx.write_to_clipboard(gpui::ClipboardItem::new_string(pdu_hex.clone()));
+                                window.push_notification(Notification::info("已复制请求 PDU"), cx);
+                            }
+                        }),
+                );
+
+            let result_frame = h_flex()
+                .gap_2()
+                .items_center()
+                .child(
+                    div()
+                        .flex_1()
+                        .text_size(px(12.))
+                        .text_color(_cx.theme().muted_foreground)
+                        .child("完整发送帧（MBAP + PDU）"),
+                )
+                .child(
+                    div()
+                        .text_size(px(13.))
+                        .text_color(if ok { _cx.theme().green } else { _cx.theme().red })
+                        .child(if ok { frame_hex.clone() } else { "—".to_string() }),
+                )
+                .child(
+                    Button::new("copy-frame")
+                        .ghost()
+                        .small()
+                        .icon(IconName::Copy)
+                        .tooltip("复制完整发送帧")
+                        .disabled(!ok)
+                        .on_click({
+                            let frame_hex = frame_hex.clone();
+                            move |_, window, cx| {
+                                cx.write_to_clipboard(gpui::ClipboardItem::new_string(frame_hex.clone()));
+                                window.push_notification(Notification::info("已复制完整发送帧"), cx);
+                            }
+                        }),
+                );
+
+            let mut body = v_flex()
+                .gap_3()
+                .px_2()
+                .child(select_row)
+                .child(header_row)
+                .child(value_row);
+            if !error.is_empty() {
+                body = body.child(
+                    div()
+                        .text_size(px(12.))
+                        .text_color(_cx.theme().red)
+                        .child(error),
+                );
+            }
+            body = body.child(result_pdu).child(result_frame);
+
+            dialog
+                .title("Modbus 请求 / 消息生成".to_string())
+                .width(px(720.))
+                .child(body)
+                .on_ok(move |_, window, cx| {
+                    window.close_dialog(cx);
+                    true
+                })
+        });
+    }
+
     // -----------------------------------------------------------------------
     // Rendering
     // -----------------------------------------------------------------------
@@ -2563,6 +3051,16 @@ impl AppView {
                                     .on_click(cx.listener(|this, _, window, cx| {
                                         this.open_parser_dialog(window, cx);
                                     })),
+                            )
+                            .child(
+                                Button::new("modbus-gen")
+                                    .ghost()
+                                    .small()
+                                    .label("Modbus 发送")
+                                    .tooltip("生成 Modbus 请求 / 发送消息（选功能码 / 类型 / 字节序），可复制")
+                                    .on_click(cx.listener(|this, _, window, cx| {
+                                        this.open_generator_dialog(window, cx);
+                                    })),
                             ),
                     ),
             )
@@ -2573,6 +3071,170 @@ impl AppView {
                     .scrollbar_visible(true, true)
                     .with_size(px(44.)),
             )
+    }
+
+    fn render_log_panel(
+        &mut self,
+        _window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let theme = cx.theme();
+        let expanded = self.log_expanded.load(Ordering::Relaxed);
+        let entries: Vec<MessageLogEntry> = {
+            let guard = self.logs.read().unwrap();
+            guard.iter().cloned().collect()
+        };
+        let total = entries.len();
+
+        let header = h_flex()
+            .gap_2()
+            .items_center()
+            .px_2()
+            .h(px(30.))
+            .border_b_1()
+            .border_color(theme.border)
+            .bg(theme.sidebar)
+            .child(
+                div()
+                    .text_size(px(13.))
+                    .font_weight(gpui::FontWeight::SEMIBOLD)
+                    .child(format!("消息日志 ({total})")),
+            )
+            .child(
+                div()
+                    .text_size(px(12.))
+                    .text_color(theme.muted_foreground)
+                    .child("接收 / 发送 · 功能码 · 字节数"),
+            )
+            .child(div().flex_1())
+            .child(
+                Button::new("clear-log")
+                    .ghost()
+                    .small()
+                    .icon(IconName::Delete)
+                    .tooltip("清除全部消息日志")
+                    .label("清除")
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.logs.write().unwrap().clear();
+                        cx.notify();
+                    })),
+            )
+            .child(
+                Button::new("toggle-log")
+                    .ghost()
+                    .small()
+                    .icon(if expanded {
+                        IconName::ChevronDown
+                    } else {
+                        IconName::ChevronRight
+                    })
+                    .label(if expanded { "折叠" } else { "展开" })
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.log_expanded.fetch_xor(true, Ordering::Relaxed);
+                        cx.notify();
+                    })),
+            );
+
+        let body = if expanded && !entries.is_empty() {
+            let rows = entries
+                .iter()
+                .rev()
+                .enumerate()
+                .map(|(i, e)| {
+                    let (dir_color, dir_icon) = match e.direction {
+                        MsgDirection::Received => (theme.blue, IconName::ArrowDown),
+                        MsgDirection::Sent => (theme.green, IconName::ArrowUp),
+                    };
+                    let hex = e.hex.clone();
+                    let time = e.time.clone();
+                    h_flex()
+                        .gap_3()
+                        .items_center()
+                        .px_3()
+                        .py_1()
+                        .border_b_1()
+                        .border_color(theme.border.opacity(0.5))
+                        .child(
+                            div()
+                                .text_size(px(11.))
+                                .text_color(theme.muted_foreground)
+                                .child(time),
+                        )
+                        .child(
+                            h_flex()
+                                .gap_1()
+                                .items_center()
+                                .child(Icon::new(dir_icon).small().text_color(dir_color))
+                                .child(
+                                    div()
+                                        .text_size(px(12.))
+                                        .text_color(dir_color)
+                                        .child(e.direction.label()),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .w(px(64.))
+                                .text_size(px(12.))
+                                .text_color(theme.foreground)
+                                .child(format!("FC {:#04X}", e.function_code)),
+                        )
+                        .child(
+                            div()
+                                .w(px(86.))
+                                .text_size(px(12.))
+                                .text_color(theme.muted_foreground)
+                                .child(format!("{} B · {} 寄存器", e.bytes, e.registers)),
+                        )
+                        .child(
+                            div()
+                                .flex_1()
+                                .text_size(px(11.))
+                                .text_color(theme.foreground)
+                                .child(truncate_hex(&hex, 52)),
+                        )
+                        .child(
+                            Button::new(("copy-log", i))
+                                .ghost()
+                                .xsmall()
+                                .icon(IconName::Copy)
+                                .tooltip("复制完整消息")
+                                .on_click(move |_, window, cx| {
+                                    cx.write_to_clipboard(
+                                        gpui::ClipboardItem::new_string(hex.clone()),
+                                    );
+                                    window.push_notification(
+                                        Notification::info("已复制完整消息到剪贴板"),
+                                        cx,
+                                    );
+                                }),
+                        )
+                })
+                .collect::<Vec<_>>();
+            v_flex()
+                .id("log-body")
+                .max_h(px(220.))
+                .overflow_y_scrollbar()
+                .children(rows)
+                .into_any_element()
+        } else if expanded {
+            div()
+                .px_3()
+                .py_2()
+                .text_size(px(12.))
+                .text_color(theme.muted_foreground)
+                .child("暂无消息日志 · 启动协议并接收/发送请求后自动记录")
+                .into_any_element()
+        } else {
+            div().into_any_element()
+        };
+
+        v_flex()
+            .flex_shrink_0()
+            .border_t_1()
+            .border_color(theme.border)
+            .child(header)
+            .child(body)
     }
 
     fn render_status_bar(
@@ -2633,6 +3295,7 @@ impl Render for AppView {
             .text_color(theme.foreground)
             .child(self.render_title_bar(window, cx))
             .child(self.render_body(window, cx))
+            .child(self.render_log_panel(window, cx))
             .child(self.render_status_bar(window, cx))
             .children(Root::render_dialog_layer(window, cx))
             .children(Root::render_notification_layer(window, cx))

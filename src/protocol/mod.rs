@@ -14,10 +14,12 @@
 
 pub mod modbus;
 
+use std::collections::VecDeque;
 use std::sync::{
-    Arc,
+    Arc, RwLock,
     atomic::{AtomicU64, AtomicUsize, Ordering},
 };
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::model::SharedStore;
 
@@ -64,6 +66,74 @@ impl ServerStats {
     }
 }
 
+/// Direction of a logged protocol message, as seen by the simulator.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum MsgDirection {
+    /// A message our server sent back to a client.
+    Sent,
+    /// A message our server received from a client.
+    Received,
+}
+
+impl MsgDirection {
+    /// Short UI label.
+    pub fn label(self) -> &'static str {
+        match self {
+            MsgDirection::Sent => "发送",
+            MsgDirection::Received => "接收",
+        }
+    }
+}
+
+/// One logged protocol frame (request/response) shown in the UI log panel.
+#[derive(Clone, Debug)]
+pub struct MessageLogEntry {
+    pub direction: MsgDirection,
+    /// Function code (0 if not applicable).
+    pub function_code: u8,
+    /// Total frame length in bytes.
+    pub bytes: usize,
+    /// Number of 16-bit register words in the payload (0 when not applicable).
+    pub registers: usize,
+    /// Full message rendered as big-endian hex.
+    pub hex: String,
+    /// `HH:MM:SS` wall-clock time.
+    pub time: String,
+}
+
+/// Max entries kept in the shared message log (ring buffer).
+pub const MAX_LOG_ENTRIES: usize = 200;
+
+/// A shared, capped, thread-safe ring buffer of logged protocol frames.
+pub type SharedMessageLog = Arc<RwLock<VecDeque<MessageLogEntry>>>;
+
+/// Create an empty shared message log.
+pub fn shared_message_log() -> SharedMessageLog {
+    Arc::new(RwLock::new(VecDeque::with_capacity(MAX_LOG_ENTRIES)))
+}
+
+/// Push a frame into the log, evicting the oldest entry once full.
+pub fn log_message(logs: &SharedMessageLog, entry: MessageLogEntry) {
+    if let Ok(mut q) = logs.write() {
+        if q.len() >= MAX_LOG_ENTRIES {
+            q.pop_front();
+        }
+        q.push_back(entry);
+    }
+}
+
+/// Current `HH:MM:SS` timestamp.
+pub fn timestamp() -> String {
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let h = (secs / 3600) % 24;
+    let m = (secs / 60) % 60;
+    let s = secs % 60;
+    format!("{h:02}:{m:02}:{s:02}")
+}
+
 /// Server lifecycle state, shown in the UI as a badge.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum ServerState {
@@ -94,6 +164,8 @@ pub struct ProtocolContext {
     pub store: SharedStore,
     /// Protocol-wide statistics.
     pub stats: Arc<ServerStats>,
+    /// Shared message log (received/sent frames) for the UI log panel.
+    pub logs: SharedMessageLog,
 }
 
 /// Everything a simulated protocol server must provide.
@@ -152,5 +224,31 @@ mod tests {
         s.client_disconnected();
         assert_eq!(s.current_clients.load(Ordering::Relaxed), 1);
         assert_eq!(s.peak_clients.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn message_log_ring_buffer_caps_and_orders() {
+        let logs = shared_message_log();
+        for i in 0..(MAX_LOG_ENTRIES + 20) {
+            log_message(
+                &logs,
+                MessageLogEntry {
+                    direction: if i % 2 == 0 { MsgDirection::Sent } else { MsgDirection::Received },
+                    function_code: (i % 0x10) as u8,
+                    bytes: i + 7,
+                    registers: i,
+                    hex: format!("{i:02X}"),
+                    time: timestamp(),
+                },
+            );
+        }
+        let q = logs.read().unwrap();
+        assert_eq!(q.len(), MAX_LOG_ENTRIES);
+        // The (N+20)th entry has function_code = (MAX_LOG_ENTRIES+19) % 0x10.
+        assert_eq!(
+            q.back().unwrap().function_code,
+            ((MAX_LOG_ENTRIES + 19) % 0x10) as u8
+        );
+        assert_eq!(q.front().unwrap().registers, 20);
     }
 }

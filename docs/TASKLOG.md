@@ -180,6 +180,31 @@
 - 预解析/`parse_hex_into_parser` 中在 `parser_state.update` 闭包内再调 `type_select.update` 会双向借用 `cx` → 先算 `vt` 到局部、在 update 闭包外另设类型下拉。
 - `encode_u64` 采用「每个 32 位半字独立套字节序」约定：CDAB 高半=字交换、低半=字交换，需与测试预期一致。
 
+### ✅ 已完成：阶段八 — 消息日志面板 + Modbus 请求/发送生成器
+
+用户新增需求（本次会话）：
+
+> 1. 主界面下方添加发送请求日志列表，可按钮折叠/显示，区分发送/接收、功能码/字节数(寄存器个数)/完整消息16进制，可复制完整消息。
+> 2. 添加 Modbus 请求/发送消息生成弹框：选择数据类型、字节序，根据输入内容生成请求完整消息，同时可生成发送消息，有复制按钮直接复制到剪贴板。
+
+| # | 任务 | 说明 | 状态 |
+|---|------|------|------|
+| 1 | 消息日志模型 | `protocol/mod.rs` 新增 `MessageLogEntry`/`MsgDirection`/`SharedMessageLog`（`Arc<RwLock<VecDeque>>`，上限 200 环形缓冲）、`log_message`/`timestamp`/`shared_message_log`；`ProtocolContext` 增加 `logs` 字段 | ✅ |
+| 2 | 服务端打点 | `modbus.rs` 在 `handle_connection` 收到请求（Rx）与发出响应（Tx）时写入日志：功能码/总字节数/寄存器估算数/完整 hex；`hex_str`/`estimate_registers`/`register_count_of_response` | ✅ |
+| 3 | AppView 接线 | `AppView::new` 创建 `logs`/`log_expanded`，传入 `ProtocolContext`；状态栏上方渲染日志面板 | ✅ |
+| 4 | 日志面板 UI | 底部「消息日志」面板：接收/发送彩色区分、FC、`N B · M 寄存器`、截断 hex、每条「复制」按钮（`ClipboardItem`）；可收缩/展开/清空，滚动列表最大高 220 | ✅ |
+| 5 | 生成器模型 | `build_modbus_frames`（FC 01/02/03/04/05/06/0F/10），`encode_generator_words`/`parse_bit_string`/`pack_bits`/`hex_bytes`，`GenFcItem`；MBAP+PDU 与 PDU 双输出 | ✅ |
+| 6 | 生成器对话框 | 「Modbus 发送」按钮打开：功能码/类型/字节序下拉 + 事务/单元/地址/数量/写入值(String(N)) 输入，实时生成「请求 PDU」与「完整发送帧」，各带复制按钮；错误提示 | ✅ |
+| 7 | 构建/测试/验证 | `cargo build` 无警告；积分测试补 `logs`；新增环形缓冲单测；36 单测 + 1 集成全绿 | ✅ |
+| 8 | 文档 | `README.md` 补充消息日志面板与生成器说明 | ✅ |
+
+**踩坑记录：**
+- `ProtocolContext` 新增 `logs` 字段 → 需同步更新 `app.rs` 与 `tests/modbus_tcp.rs` 的构造处。
+- 日志面板在渲染闭包中给每行复制按钮 `move` 闭包，需先 clone 出拥有型 `hex`/`time`；`fn` 闭包（每次渲染重建）不能直接消费外层实体。
+- 弹框内 `field` 帮助闭包用 `&str` 标签在 `.child()` 需 `'static` → 改为 `&'static str`（字面量）。
+- 剪贴板：`cx.write_to_clipboard(gpui::ClipboardItem::new_string(text))`（`&mut App` 可直接调用）。
+
+
 
 
 ### ⏳ 计划中：后续阶段（可选）
@@ -239,3 +264,5 @@ BADC `[0x3412, 0x7856]`；DCBA `[0x7856, 0x3412]`。
 | 阶段六完成 | `cargo test --lib protocol::modbus` | 含 6 个新增解析用例 |
 | 阶段七完成 | `cargo build` | 无警告 |
 | 阶段七完成 | `cargo test` | 36 通过 / 0 失败（35 单测 + 1 集成） |
+| 阶段八完成 | `cargo build` | 无警告 |
+| 阶段八完成 | `cargo test` | 37 通过 / 0 失败（36 单测 + 1 集成） |
