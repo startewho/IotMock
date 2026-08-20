@@ -7,6 +7,7 @@ use std::sync::{
 };
 use std::time::Duration;
 
+use gpui::relative;
 use gpui::{
     div, prelude::FluentBuilder as _, px, App, AppContext as _, AsyncApp, Context, Entity,
     InteractiveElement, IntoElement, ParentElement as _, Render, Styled as _, Subscription, Task,
@@ -3008,12 +3009,15 @@ impl AppView {
     }
 
     fn render_body(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        h_flex()
-            .flex_1()
-            .size_full()
-            .overflow_hidden()
-            .child(self.render_sidebar(window, cx))
-            .child(self.render_content(window, cx))
+        v_flex().h_full().min_h_0().overflow_hidden().child(
+            h_flex()
+                .flex_1()
+                .w_full()
+                .min_h_0()
+                .overflow_hidden()
+                .child(self.render_sidebar(window, cx))
+                .child(self.render_content(window, cx)),
+        )
     }
 
     fn render_sidebar(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
@@ -3384,7 +3388,6 @@ impl AppView {
                     .with_size(px(44.)))
             )
             .child(self.render_log_panel(window, cx))
-            .child(self.render_status_bar(window, cx))
     }
 
     fn render_log_panel(
@@ -3496,9 +3499,10 @@ impl AppView {
             .join("  |  ");
 
         h_flex()
-            .h(px(30.))
-            .px_3()
-            .gap_4()
+            .h(px(20.))
+            .flex_shrink_0()
+            .m_1()
+            .text_center()
             .items_center()
             .border_t_1()
             .border_color(theme.border)
@@ -3522,13 +3526,14 @@ impl AppView {
 impl Render for AppView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let theme = cx.theme();
-        div()
-            .size_full()
-            .flex_col()
+        v_flex()
+            .flex_auto()
+            .h_full()
             .bg(theme.background)
             .text_color(theme.foreground)
             .child(self.render_title_bar(window, cx))
             .child(self.render_body(window, cx))
+            .child(self.render_status_bar(window, cx))
             .children(Root::render_dialog_layer(window, cx))
             .children(Root::render_notification_layer(window, cx))
     }
