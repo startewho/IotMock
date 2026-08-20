@@ -16,8 +16,8 @@ pub mod modbus;
 
 use std::collections::VecDeque;
 use std::sync::{
-    Arc, RwLock,
     atomic::{AtomicU64, AtomicUsize, Ordering},
+    Arc, RwLock,
 };
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -39,10 +39,12 @@ impl ServerStats {
         let cur = self.current_clients.fetch_add(1, Ordering::Relaxed) + 1;
         let mut peak = self.peak_clients.load(Ordering::Relaxed);
         while cur > peak {
-            match self
-                .peak_clients
-                .compare_exchange_weak(peak, cur, Ordering::Relaxed, Ordering::Relaxed)
-            {
+            match self.peak_clients.compare_exchange_weak(
+                peak,
+                cur,
+                Ordering::Relaxed,
+                Ordering::Relaxed,
+            ) {
                 Ok(_) => break,
                 Err(actual) => peak = actual,
             }
@@ -245,7 +247,11 @@ mod tests {
             log_message(
                 &logs,
                 MessageLogEntry {
-                    direction: if i % 2 == 0 { MsgDirection::Sent } else { MsgDirection::Received },
+                    direction: if i % 2 == 0 {
+                        MsgDirection::Sent
+                    } else {
+                        MsgDirection::Received
+                    },
                     function_code: (i % 0x10) as u8,
                     bytes: i + 7,
                     registers: i,

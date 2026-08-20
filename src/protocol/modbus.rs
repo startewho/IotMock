@@ -23,8 +23,8 @@
 use std::{
     net::SocketAddr,
     sync::{
-        Arc, Mutex,
         atomic::{AtomicBool, Ordering},
+        Arc, Mutex,
     },
     time::Duration,
 };
@@ -372,7 +372,10 @@ fn read_bits(store: &SharedStore, area: Area, data: &[u8]) -> Result<Vec<u8>, Mo
     }
     check_range(store, area, addr, qty as usize)?;
 
-    let values = store.read().unwrap().range(area, addr as usize, qty as usize);
+    let values = store
+        .read()
+        .unwrap()
+        .range(area, addr as usize, qty as usize);
     let values = values.unwrap(); // range already checked
     let byte_count = (qty as usize).div_ceil(8);
     let mut bytes = vec![0u8; byte_count];
@@ -395,7 +398,10 @@ fn read_words(store: &SharedStore, area: Area, data: &[u8]) -> Result<Vec<u8>, M
     }
     check_range(store, area, addr, qty as usize)?;
 
-    let values = store.read().unwrap().range(area, addr as usize, qty as usize);
+    let values = store
+        .read()
+        .unwrap()
+        .range(area, addr as usize, qty as usize);
     let values = values.unwrap();
     let mut out = Vec::with_capacity(1 + qty as usize * 2);
     out.push((qty as usize * 2) as u8);
@@ -423,7 +429,10 @@ fn write_single_bit(
     check_range(store, area, addr, 1)?;
 
     let bit = if value == 0xFF00 { 1 } else { 0 };
-    store.write().unwrap().set(area, addr as usize, bit, &writer(0));
+    store
+        .write()
+        .unwrap()
+        .set(area, addr as usize, bit, &writer(0));
     stats.cells_written(1);
 
     // Echo the request back.
@@ -444,7 +453,10 @@ fn write_single_word(
     let value = u16::from_be_bytes([data[2], data[3]]);
     check_range(store, area, addr, 1)?;
 
-    store.write().unwrap().set(area, addr as usize, value, &writer(0));
+    store
+        .write()
+        .unwrap()
+        .set(area, addr as usize, value, &writer(0));
     stats.cells_written(1);
 
     Ok(data[..4].to_vec())
@@ -474,7 +486,10 @@ fn write_multiple_bits(
     for (i, v) in values.iter_mut().enumerate() {
         *v = ((data[5 + i / 8] >> (i % 8)) & 1) as u16;
     }
-    store.write().unwrap().set_range(area, addr as usize, &values, &writer(0));
+    store
+        .write()
+        .unwrap()
+        .set_range(area, addr as usize, &values, &writer(0));
     stats.cells_written(qty as u64);
 
     Ok(data[..4].to_vec())
@@ -505,7 +520,10 @@ fn write_multiple_words(
         let off = 5 + i * 2;
         values.push(u16::from_be_bytes([data[off], data[off + 1]]));
     }
-    store.write().unwrap().set_range(area, addr as usize, &values, &writer(0));
+    store
+        .write()
+        .unwrap()
+        .set_range(area, addr as usize, &values, &writer(0));
     stats.cells_written(qty as u64);
 
     Ok(data[..4].to_vec())
@@ -533,9 +551,7 @@ fn estimate_registers(pdu: &[u8]) -> usize {
         return 0;
     }
     match pdu[0] {
-        0x01 | 0x02 | 0x03 | 0x04 => {
-            u16::from_be_bytes([pdu[3], pdu[4]]) as usize
-        }
+        0x01 | 0x02 | 0x03 | 0x04 => u16::from_be_bytes([pdu[3], pdu[4]]) as usize,
         0x05 | 0x06 => 1,
         0x0F => {
             let bc = pdu.get(5).copied().unwrap_or(0) as usize;
@@ -686,10 +702,7 @@ fn parse_payload(bytes: &[u8], fc: u8, length: usize) -> (String, Vec<u16>) {
         }
         0x06 => {
             let v = u16::from_be_bytes([bytes[10], bytes[11]]);
-            (
-                format!("写单个寄存器：值 0x{v:04X}（16 位）"),
-                vec![v],
-            )
+            (format!("写单个寄存器：值 0x{v:04X}（16 位）"), vec![v])
         }
         0x05 => {
             let v = u16::from_be_bytes([bytes[10], bytes[11]]);
@@ -713,7 +726,10 @@ fn parse_payload(bytes: &[u8], fc: u8, length: usize) -> (String, Vec<u16>) {
                 let data = &bytes[13..(13 + bc).min(bytes.len())];
                 let words = bytes_to_words(data);
                 (
-                    format!("请求：起始地址 {}，数量 {qty}，{bc} 字节数据", u16::from_be_bytes([bytes[8], bytes[9]])),
+                    format!(
+                        "请求：起始地址 {}，数量 {qty}，{bc} 字节数据",
+                        u16::from_be_bytes([bytes[8], bytes[9]])
+                    ),
                     words,
                 )
             }
@@ -758,14 +774,22 @@ mod tests {
     use super::*;
 
     fn test_store() -> SharedStore {
-        Arc::new(std::sync::RwLock::new(crate::model::RegisterStore::new(256)))
+        Arc::new(std::sync::RwLock::new(crate::model::RegisterStore::new(
+            256,
+        )))
     }
 
     #[test]
     fn read_holding_registers_roundtrip() {
         let store = test_store();
-        store.write().unwrap().set(Area::HoldingRegisters, 3, 0x1234, "test");
-        store.write().unwrap().set(Area::HoldingRegisters, 4, 0xABCD, "test");
+        store
+            .write()
+            .unwrap()
+            .set(Area::HoldingRegisters, 3, 0x1234, "test");
+        store
+            .write()
+            .unwrap()
+            .set(Area::HoldingRegisters, 4, 0xABCD, "test");
 
         let pdu = [0x03, 0x00, 0x03, 0x00, 0x02];
         let resp = process_pdu(&pdu, &store, &ServerStats::default());
@@ -775,9 +799,7 @@ mod tests {
     #[test]
     fn write_multiple_registers_then_read() {
         let store = test_store();
-        let pdu = [
-            0x10, 0x00, 0x00, 0x00, 0x02, 0x04, 0x00, 0x0A, 0x00, 0x0B,
-        ];
+        let pdu = [0x10, 0x00, 0x00, 0x00, 0x02, 0x04, 0x00, 0x0A, 0x00, 0x0B];
         let resp = process_pdu(&pdu, &store, &ServerStats::default());
         assert_eq!(resp, vec![0x10, 0x00, 0x00, 0x00, 0x02]);
 
@@ -869,9 +891,9 @@ mod tests {
 
     #[test]
     fn parse_rejects_short_and_bad_frames() {
-        assert!(parse_modbus_hex("0103").is_err());        // too short
-        assert!(parse_modbus_hex("xyz").is_err());          // bad chars
+        assert!(parse_modbus_hex("0103").is_err()); // too short
+        assert!(parse_modbus_hex("xyz").is_err()); // bad chars
         assert!(parse_modbus_hex("00010000000601030").is_err()); // odd length
-        assert!(parse_modbus_hex("").is_err());             // empty
+        assert!(parse_modbus_hex("").is_err()); // empty
     }
 }

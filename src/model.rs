@@ -273,38 +273,62 @@ impl ValueType {
     ) -> Result<Vec<u16>, String> {
         match self {
             ValueType::Uint16 => {
-                let v: u16 = text.trim().parse().map_err(|_| "无效的 UInt16 数值".to_string())?;
+                let v: u16 = text
+                    .trim()
+                    .parse()
+                    .map_err(|_| "无效的 UInt16 数值".to_string())?;
                 Ok(vec![v])
             }
             ValueType::Int16 => {
-                let v: i16 = text.trim().parse().map_err(|_| "无效的 Int16 数值".to_string())?;
+                let v: i16 = text
+                    .trim()
+                    .parse()
+                    .map_err(|_| "无效的 Int16 数值".to_string())?;
                 Ok(vec![v as u16])
             }
             ValueType::Uint32 => {
-                let v: u32 = text.trim().parse().map_err(|_| "无效的 UInt32 数值".to_string())?;
+                let v: u32 = text
+                    .trim()
+                    .parse()
+                    .map_err(|_| "无效的 UInt32 数值".to_string())?;
                 Ok(byte_order.encode_u32(v).to_vec())
             }
             ValueType::Int32 => {
-                let v: i32 = text.trim().parse().map_err(|_| "无效的 Int32 数值".to_string())?;
+                let v: i32 = text
+                    .trim()
+                    .parse()
+                    .map_err(|_| "无效的 Int32 数值".to_string())?;
                 Ok(byte_order.encode_u32(v as u32).to_vec())
             }
             ValueType::Float32 => {
-                let v: f32 = text.trim().parse().map_err(|_| "无效的 Float32 数值".to_string())?;
+                let v: f32 = text
+                    .trim()
+                    .parse()
+                    .map_err(|_| "无效的 Float32 数值".to_string())?;
                 if !v.is_finite() {
                     return Err("浮点数必须为有限值".to_string());
                 }
                 Ok(byte_order.encode_u32(v.to_bits()).to_vec())
             }
             ValueType::Uint64 => {
-                let v: u64 = text.trim().parse().map_err(|_| "无效的 UInt64 数值".to_string())?;
+                let v: u64 = text
+                    .trim()
+                    .parse()
+                    .map_err(|_| "无效的 UInt64 数值".to_string())?;
                 Ok(byte_order.encode_u64(v).to_vec())
             }
             ValueType::Int64 => {
-                let v: i64 = text.trim().parse().map_err(|_| "无效的 Int64 数值".to_string())?;
+                let v: i64 = text
+                    .trim()
+                    .parse()
+                    .map_err(|_| "无效的 Int64 数值".to_string())?;
                 Ok(byte_order.encode_u64(v as u64).to_vec())
             }
             ValueType::Double => {
-                let v: f64 = text.trim().parse().map_err(|_| "无效的 Double 数值".to_string())?;
+                let v: f64 = text
+                    .trim()
+                    .parse()
+                    .map_err(|_| "无效的 Double 数值".to_string())?;
                 if !v.is_finite() {
                     return Err("浮点数必须为有限值".to_string());
                 }
@@ -326,8 +350,12 @@ impl ValueType {
                 let bits = byte_order.decode_u32([words[0], words[1]]);
                 f32::from_bits(bits).to_string()
             }
-            ValueType::Uint64 => byte_order.decode_u64([words[0], words[1], words[2], words[3]]).to_string(),
-            ValueType::Int64 => (byte_order.decode_u64([words[0], words[1], words[2], words[3]]) as i64).to_string(),
+            ValueType::Uint64 => byte_order
+                .decode_u64([words[0], words[1], words[2], words[3]])
+                .to_string(),
+            ValueType::Int64 => {
+                (byte_order.decode_u64([words[0], words[1], words[2], words[3]]) as i64).to_string()
+            }
             ValueType::Double => {
                 let bits = byte_order.decode_u64([words[0], words[1], words[2], words[3]]);
                 f64::from_bits(bits).to_string()
@@ -353,14 +381,16 @@ fn store_string(s: &str, byte_order: ByteOrder, max_regs: usize) -> Result<Vec<u
     }
     let n = bytes.len() / 2;
     if n > max_regs {
-        return Err(format!(
-            "字符串需占用 {n} 个寄存器，超出上限 {max_regs} 个"
-        ));
+        return Err(format!("字符串需占用 {n} 个寄存器，超出上限 {max_regs} 个"));
     }
     Ok((0..n)
         .map(|i| match byte_order {
-            ByteOrder::Abcd | ByteOrder::Badc => u16::from_be_bytes([bytes[2 * i], bytes[2 * i + 1]]),
-            ByteOrder::Cdab | ByteOrder::Dcba => u16::from_be_bytes([bytes[2 * i + 1], bytes[2 * i]]),
+            ByteOrder::Abcd | ByteOrder::Badc => {
+                u16::from_be_bytes([bytes[2 * i], bytes[2 * i + 1]])
+            }
+            ByteOrder::Cdab | ByteOrder::Dcba => {
+                u16::from_be_bytes([bytes[2 * i + 1], bytes[2 * i]])
+            }
         })
         .collect())
 }
@@ -573,13 +603,7 @@ impl RegisterStore {
     }
 
     /// Write a range of cells. Returns `false` when out of bounds (no partial write).
-    pub fn set_range(
-        &mut self,
-        area: Area,
-        addr: usize,
-        values: &[u16],
-        writer: &str,
-    ) -> bool {
+    pub fn set_range(&mut self, area: Area, addr: usize, values: &[u16], writer: &str) -> bool {
         if values.is_empty()
             || addr
                 .checked_add(values.len())
@@ -644,7 +668,9 @@ impl RegisterStore {
     /// real-time UI visibly updates even without any TCP client connected.
     /// `seed` is the tick counter; the pseudo-random sequence is reproducible.
     pub fn simulate_tick(&mut self, seed: u64) {
-        let mut x = seed.wrapping_mul(0x9E37_79B9_7F4A_7C15).wrapping_add(0x1234_5678_9ABC_DEF0);
+        let mut x = seed
+            .wrapping_mul(0x9E37_79B9_7F4A_7C15)
+            .wrapping_add(0x1234_5678_9ABC_DEF0);
         let n = self.len(Area::HoldingRegisters);
         if n == 0 {
             return;
@@ -808,15 +834,16 @@ mod tests {
             .encode_text("12345", ByteOrder::Abcd, 1)
             .unwrap();
         assert_eq!(words, vec![12345]);
-        assert_eq!(ValueType::Uint16.decode_words(&words, ByteOrder::Abcd), "12345");
+        assert_eq!(
+            ValueType::Uint16.decode_words(&words, ByteOrder::Abcd),
+            "12345"
+        );
     }
 
     #[test]
     fn value_type_int32_round_trip_with_byte_order() {
         for bo in ByteOrder::ALL {
-            let words = ValueType::Int32
-                .encode_text("-123456789", bo, 2)
-                .unwrap();
+            let words = ValueType::Int32.encode_text("-123456789", bo, 2).unwrap();
             assert_eq!(words.len(), 2);
             assert_eq!(
                 ValueType::Int32.decode_words(&words, bo),
@@ -832,7 +859,8 @@ mod tests {
         let words = ValueType::Float32
             .encode_text("2.5", ByteOrder::Abcd, 2)
             .unwrap();
-        let decoded = ValueType::Float32.decode_words(&words, ByteOrder::Abcd)
+        let decoded = ValueType::Float32
+            .decode_words(&words, ByteOrder::Abcd)
             .parse::<f32>()
             .unwrap();
         assert!((decoded - 2.5).abs() < 1e-4);
@@ -853,14 +881,20 @@ mod tests {
             .encode_text("中", ByteOrder::Abcd, 8)
             .unwrap();
         assert_eq!(words.len(), 2);
-        assert_eq!(ValueType::String.decode_words(&words, ByteOrder::Abcd), "中");
+        assert_eq!(
+            ValueType::String.decode_words(&words, ByteOrder::Abcd),
+            "中"
+        );
 
         // Multi-char ASCII string.
         let words = ValueType::String
             .encode_text("Hi", ByteOrder::Abcd, 8)
             .unwrap();
         assert_eq!(words, vec![0x4869]);
-        assert_eq!(ValueType::String.decode_words(&words, ByteOrder::Abcd), "Hi");
+        assert_eq!(
+            ValueType::String.decode_words(&words, ByteOrder::Abcd),
+            "Hi"
+        );
     }
 
     #[test]
@@ -872,8 +906,12 @@ mod tests {
 
     #[test]
     fn value_type_invalid_number_rejected() {
-        assert!(ValueType::Uint16.encode_text("abc", ByteOrder::Abcd, 1).is_err());
-        assert!(ValueType::Float32.encode_text("12.5x", ByteOrder::Abcd, 2).is_err());
+        assert!(ValueType::Uint16
+            .encode_text("abc", ByteOrder::Abcd, 1)
+            .is_err());
+        assert!(ValueType::Float32
+            .encode_text("12.5x", ByteOrder::Abcd, 2)
+            .is_err());
     }
 
     #[test]
@@ -891,7 +929,10 @@ mod tests {
         let words = encode_string_fixed("Hi", ByteOrder::Abcd, 8, 7).unwrap();
         assert_eq!(words.len(), 4);
         assert_eq!(words, vec![0x4869, 0x0000, 0x0000, 0x0000]);
-        assert_eq!(ValueType::String.decode_words(&words, ByteOrder::Abcd), "Hi");
+        assert_eq!(
+            ValueType::String.decode_words(&words, ByteOrder::Abcd),
+            "Hi"
+        );
     }
 
     #[test]
@@ -959,9 +1000,7 @@ mod tests {
                 bo
             );
             // Double
-            let words = ValueType::Double
-                .encode_text("3.14159", bo, 4)
-                .unwrap();
+            let words = ValueType::Double.encode_text("3.14159", bo, 4).unwrap();
             let decoded = ValueType::Double
                 .decode_words(&words, bo)
                 .parse::<f64>()

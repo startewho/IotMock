@@ -2,13 +2,10 @@
 //! exercise it with a raw TCP client (MBAP + PDU), verifying that writes are
 //! visible to the shared store and reads return correct values.
 
-use std::sync::{
-    Arc,
-    atomic::Ordering,
-};
+use std::sync::{atomic::Ordering, Arc};
 
-use iot_mock::model::{Area, shared_store};
-use iot_mock::protocol::{Protocol, ProtocolContext, ServerStats, modbus::ModbusTcpServer};
+use iot_mock::model::{shared_store, Area};
+use iot_mock::protocol::{modbus::ModbusTcpServer, Protocol, ProtocolContext, ServerStats};
 
 fn free_port() -> u16 {
     // Bind to port 0 to get an OS-assigned ephemeral port, then drop it.
@@ -20,12 +17,7 @@ fn free_port() -> u16 {
 }
 
 /// One Modbus TCP request round trip: send MBAP+PDU, read MBAP+PDU response.
-fn modbus_request(
-    stream: &mut std::net::TcpStream,
-    tid: u16,
-    unit: u8,
-    pdu: &[u8],
-) -> Vec<u8> {
+fn modbus_request(stream: &mut std::net::TcpStream, tid: u16, unit: u8, pdu: &[u8]) -> Vec<u8> {
     use std::io::{Read, Write};
     let mut tx = Vec::with_capacity(7 + pdu.len());
     tx.extend_from_slice(&tid.to_be_bytes());
@@ -60,15 +52,24 @@ fn server_end_to_end_reads_and_writes() {
 
     // Wait for the accept loop to bind.
     std::thread::sleep(std::time::Duration::from_millis(300));
-    assert!(server.is_running() || matches!(server.state(), iot_mock::protocol::ServerState::Error(_)),
-        "server not running: {:?}", server.state());
+    assert!(
+        server.is_running() || matches!(server.state(), iot_mock::protocol::ServerState::Error(_)),
+        "server not running: {:?}",
+        server.state()
+    );
 
     let mut stream = std::net::TcpStream::connect(("127.0.0.1", port)).unwrap();
-    stream.set_read_timeout(Some(std::time::Duration::from_secs(2))).unwrap();
-    stream.set_write_timeout(Some(std::time::Duration::from_secs(2))).unwrap();
+    stream
+        .set_read_timeout(Some(std::time::Duration::from_secs(2)))
+        .unwrap();
+    stream
+        .set_write_timeout(Some(std::time::Duration::from_secs(2)))
+        .unwrap();
 
     // Write multiple registers (FC 0x10) at addr 0: 0x1111, 0x2222, 0x3333.
-    let write_pdu = [0x10, 0x00, 0x00, 0x00, 0x03, 0x06, 0x11, 0x11, 0x22, 0x22, 0x33, 0x33];
+    let write_pdu = [
+        0x10, 0x00, 0x00, 0x00, 0x03, 0x06, 0x11, 0x11, 0x22, 0x22, 0x33, 0x33,
+    ];
     let resp = modbus_request(&mut stream, 0x0001, 0x01, &write_pdu);
     assert_eq!(resp, vec![0x10, 0x00, 0x00, 0x00, 0x03]);
 

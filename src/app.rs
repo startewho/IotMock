@@ -7,7 +7,7 @@ use std::sync::{
 };
 use std::time::Duration;
 
-use gpui::relative;
+use gpui::Element;
 use gpui::{
     div, prelude::FluentBuilder as _, px, App, AppContext as _, AsyncApp, Context, Entity,
     InteractiveElement, IntoElement, ParentElement as _, Render, Styled as _, Subscription, Task,
@@ -3291,103 +3291,99 @@ impl AppView {
         let theme = cx.theme();
         let area = self.active_area;
         let len = self.store.read().unwrap().len(area);
-        v_flex()
-            .flex_auto()
-            .h_full()
-            .gap_2()
-            .p_3()
-            .child(
-                h_flex()
-                    .justify_between()
-                    .items_center()
-                    .child(
-                        TabBar::new("area-tabs")
-                            .selected_index(self.active_area.index())
-                            .on_click(cx.listener(|this, &ix: &usize, window, cx| {
-                                let area = ALL_AREAS[ix.min(ALL_AREAS.len() - 1)];
-                                this.set_active_area(area, window, cx);
-                            }))
-                            .child(Tab::new().label(format!(
-                                "线圈 ({})",
-                                self.store.read().unwrap().len(Area::Coils)
-                            )))
-                            .child(Tab::new().label(format!(
-                                "离散输入 ({})",
-                                self.store.read().unwrap().len(Area::DiscreteInputs)
-                            )))
-                            .child(Tab::new().label(format!(
-                                "保持寄存器 ({})",
-                                self.store.read().unwrap().len(Area::HoldingRegisters)
-                            )))
-                            .child(Tab::new().label(format!(
-                                "输入寄存器 ({})",
-                                self.store.read().unwrap().len(Area::InputRegisters)
-                            ))),
-                    )
-                    .child(
-                        h_flex()
-                            .gap_2()
+        v_flex().flex_auto()
+                    .h_full()
+                    .gap_2()
+                    .p_1()
+                    .child(h_flex()
+                            .justify_between()
                             .items_center()
                             .child(
-                                div()
-                                    .text_size(px(12.))
-                                    .text_color(theme.muted_foreground)
-                                    .child(if area.writable() {
-                                        "双击行编辑数值 · "
-                                    } else {
-                                        "只读区域 · "
-                                    })
-                                    .child(format!("共 {} 个地址", len)),
-                            )
-                            .child(div().flex_1())
-                            .child(
-                                Button::new("reset-area")
-                                    .ghost()
-                                    .small()
-                                    .label("重置")
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.reset_area(window, cx);
-                                    })),
-                            )
-                            .child(
-                                Button::new("rand-area")
-                                    .ghost()
-                                    .small()
-                                    .label("随机")
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.random_fill(window, cx);
-                                    })),
+                                TabBar::new("area-tabs")
+                                    .selected_index(self.active_area.index())
+                                    .on_click(cx.listener(|this, &ix: &usize, window, cx| {
+                                        let area = ALL_AREAS[ix.min(ALL_AREAS.len() - 1)];
+                                        this.set_active_area(area, window, cx);
+                                    }))
+                                    .child(Tab::new().label(format!(
+                                        "线圈 ({})",
+                                        self.store.read().unwrap().len(Area::Coils)
+                                    )))
+                                    .child(Tab::new().label(format!(
+                                        "离散输入 ({})",
+                                        self.store.read().unwrap().len(Area::DiscreteInputs)
+                                    )))
+                                    .child(Tab::new().label(format!(
+                                        "保持寄存器 ({})",
+                                        self.store.read().unwrap().len(Area::HoldingRegisters)
+                                    )))
+                                    .child(Tab::new().label(format!(
+                                        "输入寄存器 ({})",
+                                        self.store.read().unwrap().len(Area::InputRegisters)
+                                    ))),
                             )
                             .child(
-                                Button::new("modbus-parse")
-                                    .ghost()
-                                    .small()
-                                    .label("解析")
-                                    .tooltip("解析 Modbus TCP 帧（16 进制），查看功能码 / 类型 / 字节序 / 按位显示")
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.open_parser_dialog(window, cx);
-                                    })),
-                            )
-                            .child(
-                                Button::new("modbus-gen")
-                                    .ghost()
-                                    .small()
-                                    .label("生成")
-                                    .tooltip("生成 Modbus 请求 / 发送消息（选功能码 / 类型 / 字节序），可复制")
-                                    .on_click(cx.listener(|this, _, window, cx| {
-                                        this.open_generator_dialog(window, cx);
-                                    })),
+                                h_flex()
+                                    .gap_2()
+                                    .items_center()
+                                    .child(
+                                        div()
+                                            .text_size(px(12.))
+                                            .text_color(theme.muted_foreground)
+                                            .child(if area.writable() {
+                                                "双击行编辑数值 · "
+                                            } else {
+                                                "只读区域 · "
+                                            })
+                                            .child(format!("共 {} 个地址", len)),
+                                    )
+                                    .child(div().flex_1())
+                                    .child(
+                                        Button::new("reset-area")
+                                            .ghost()
+                                            .small()
+                                            .label("重置")
+                                            .on_click(cx.listener(|this, _, window, cx| {
+                                                this.reset_area(window, cx);
+                                            })),
+                                    )
+                                    .child(
+                                        Button::new("rand-area")
+                                            .ghost()
+                                            .small()
+                                            .label("随机")
+                                            .on_click(cx.listener(|this, _, window, cx| {
+                                                this.random_fill(window, cx);
+                                            })),
+                                    )
+                                    .child(
+                                        Button::new("modbus-parse")
+                                            .ghost()
+                                            .small()
+                                            .label("解析")
+                                            .tooltip("解析 Modbus TCP 帧（16 进制），查看功能码 / 类型 / 字节序 / 按位显示")
+                                            .on_click(cx.listener(|this, _, window, cx| {
+                                                this.open_parser_dialog(window, cx);
+                                            })),
+                                    )
+                                    .child(
+                                        Button::new("modbus-gen")
+                                            .ghost()
+                                            .small()
+                                            .label("生成")
+                                            .tooltip("生成 Modbus 请求 / 发送消息（选功能码 / 类型 / 字节序），可复制")
+                                            .on_click(cx.listener(|this, _, window, cx| {
+                                                this.open_generator_dialog(window, cx);
+                                            })),
+                                    ),
                             ),
-                    ),
-            )
-            .child(
-                div().h_full().child(Table::new(&self.table)
-                    .stripe(true)
-                    .bordered(true)
-                    .scrollbar_visible(true, true)
-                    .with_size(px(44.)))
-            )
-            .child(self.render_log_panel(window, cx))
+                    )
+                    .child(div().h_full().child(Table::new(&self.table)
+                                    .stripe(true)
+                                    .bordered(true)
+                                    .scrollbar_visible(true, true)
+                                    .with_size(px(44.))))
+           .child(self.render_log_panel(window, cx))
     }
 
     fn render_log_panel(
@@ -3400,10 +3396,10 @@ impl AppView {
         let total = self.log_table.read(cx).delegate().rows_count(cx);
 
         let header = h_flex()
-            .gap_2()
+            .gap_1()
             .items_center()
-            .px_2()
-            .h(px(40.))
+            .px_1()
+            .h(px(32.))
             .border_b_1()
             .border_color(theme.border)
             .bg(theme.sidebar)
@@ -3448,30 +3444,27 @@ impl AppView {
                     })),
             );
 
-        let body = if expanded {
-            div()
-                .id("log-table")
-                .h(px(220.))
-                .border_b_1()
-                .border_color(theme.border.opacity(0.5))
-                .child(
-                    Table::new(&self.log_table)
-                        .stripe(true)
-                        .bordered(true)
-                        .scrollbar_visible(true, false)
-                        .with_size(px(32.)),
-                )
-                .into_any_element()
-        } else {
-            div().into_any_element()
-        };
-
         v_flex()
             .flex_shrink()
             .border_1()
             .border_color(theme.border)
             .child(header)
-            .child(body)
+            .when(expanded, |v| {
+                v.child(
+                    v_flex()
+                        .id("log-table")
+                        .h(px(220.))
+                        .border_b_1()
+                        .border_color(theme.border.opacity(0.5))
+                        .child(
+                            Table::new(&self.log_table)
+                                .stripe(true)
+                                .bordered(true)
+                                .scrollbar_visible(true, false)
+                                .with_size(px(32.)),
+                        ),
+                )
+            })
     }
 
     fn render_status_bar(
